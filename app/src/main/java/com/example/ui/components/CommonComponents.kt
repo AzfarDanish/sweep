@@ -557,7 +557,7 @@ fun MediaInfoSheet(
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    val progress = (1f - (controller.offsetY.value / sheetConfig.dismissTargetOffsetPx))
+                    val progress = (1f - (controller.offsetY.floatValue / sheetConfig.dismissTargetOffsetPx))
                         .coerceIn(0f, 1f)
                     alpha = progress * 0.52f
                 }
@@ -594,7 +594,7 @@ fun MediaInfoSheet(
                     onDismissed = onDismiss,
                 )
                 .graphicsLayer {
-                    translationY = controller.offsetY.value
+                    translationY = controller.offsetY.floatValue
                 }
                 .pointerInput(Unit) {
                     detectTapGestures { /* absorb taps so scrim behind sheet is not triggered */ }

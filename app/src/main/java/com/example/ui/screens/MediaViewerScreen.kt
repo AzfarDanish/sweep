@@ -41,7 +41,6 @@ import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.KeyboardArrowUp
 import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Pause
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -63,6 +62,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.FloatState
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
@@ -77,7 +77,6 @@ import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
-import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
@@ -216,22 +215,8 @@ fun MediaViewerScreen(
     }
     val scope = rememberCoroutineScope()
 
-    val isTrashDragging by remember(trashSwipeController) {
-        derivedStateOf { trashSwipeController.phase == VerticalSwipePhase.Dragging }
-    }
     val isTrashExiting by remember(trashSwipeController) {
         derivedStateOf { trashSwipeController.phase == VerticalSwipePhase.Dismissed }
-    }
-    val isTrashPillVisible by remember(trashSwipeController) {
-        derivedStateOf {
-            trashSwipeController.offsetY.value < -24f &&
-                trashSwipeController.phase != VerticalSwipePhase.Dismissed
-        }
-    }
-    val isTrashThresholdReached by remember(trashSwipeController, trashConfig) {
-        derivedStateOf {
-            trashSwipeController.offsetY.value <= -trashConfig.dismissDistanceThresholdPx
-        }
     }
 
     val latestItems by rememberUpdatedState(items)
@@ -348,7 +333,7 @@ fun MediaViewerScreen(
                     if (nextItem != null) {
                         StackedUnderlyingCard(
                             item = nextItem,
-                            offsetYProvider = { trashSwipeController.offsetY.value },
+                            offsetY = trashSwipeController.offsetY,
                             dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
                             modifier = Modifier
                                 .fillMaxSize()
@@ -375,16 +360,16 @@ fun MediaViewerScreen(
                                 onDismissed = { onTrashItem(activeItem) },
                             )
                             .graphicsLayer {
-                                val transform = computeStackedActiveCardTransform(
-                                    offsetY = trashSwipeController.offsetY.value,
-                                    dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
-                                    dismissTargetOffsetPx = trashConfig.dismissTargetOffsetPx,
-                                )
-                                translationX = transform.translationX
-                                translationY = transform.translationY
-                                scaleX = transform.scale
-                                scaleY = transform.scale
-                                rotationZ = transform.rotationZ
+                                val currentOffsetY = trashSwipeController.offsetY.floatValue
+                                val threshold = trashConfig.dismissDistanceThresholdPx.coerceAtLeast(1f)
+                                val dismissTarget = trashConfig.dismissTargetOffsetPx.coerceAtLeast(1f)
+                                val liftProgress = (-currentOffsetY / threshold).coerceIn(0f, 1f)
+                                val exitProgress = (-currentOffsetY / dismissTarget).coerceIn(0f, 1f)
+                                val scale = 1f - (liftProgress * 0.08f) - (exitProgress * 0.06f)
+                                translationY = currentOffsetY
+                                scaleX = scale
+                                scaleY = scale
+                                rotationZ = (liftProgress * 1.8f + exitProgress * 0.7f).coerceIn(0f, 4f)
                                 cameraDistance = 16f * density
                             }
                             .background(Color.Black)
@@ -393,7 +378,10 @@ fun MediaViewerScreen(
                         HorizontalPager(
                             state = pagerState,
                             key = { page -> items[page].id },
-                            userScrollEnabled = !isCurrentZoomed && !isTrashDragging && !isTrashExiting,
+                            // Vertical drags are consumed on the Initial pass before the pager sees
+                            // them, so it is not necessary to recompose the pager when a trash drag
+                            // starts. Keeping this flag stable avoids a gesture-start frame hitch.
+                            userScrollEnabled = !isCurrentZoomed && !isTrashExiting,
                             modifier = Modifier.fillMaxSize(),
                         ) { page ->
                             val item = items[page]
@@ -428,40 +416,6 @@ fun MediaViewerScreen(
                             }
                         }
                     }
-
-                    // Active drag visual feedback pill during upward swipe gesture
-                    if (isTrashPillVisible) {
-                        Surface(
-                            color = if (isTrashThresholdReached) Color.White else Color.Black.copy(alpha = 0.82f),
-                            contentColor = if (isTrashThresholdReached) Color.Black else Color.White,
-                            shape = RoundedCornerShape(20.dp),
-                            modifier = Modifier
-                                .align(Alignment.BottomCenter)
-                                .padding(bottom = 16.dp)
-                                .zIndex(2f)
-                                .testTag("viewer_trash_pill"),
-                        ) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                modifier = Modifier.padding(horizontal = 16.dp, vertical = 10.dp),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.DeleteOutline,
-                                    contentDescription = null,
-                                    modifier = Modifier.size(18.dp),
-                                )
-                                Spacer(modifier = Modifier.width(8.dp))
-                                Text(
-                                    text = if (isTrashThresholdReached) {
-                                        "Release to move to trash"
-                                    } else {
-                                        "Swipe up to trash"
-                                    },
-                                    style = MaterialTheme.typography.labelLarge,
-                                )
-                            }
-                        }
-                    }
                 }
             }
 
@@ -470,7 +424,7 @@ fun MediaViewerScreen(
                 currentItem = currentItem,
                 isTrashPreview = isTrashPreview,
                 activeExoPlayer = activeExoPlayer,
-                controlsVisible = showControls && !isTrashDragging && !isTrashPillVisible && !isTrashExiting,
+                showControls = showControls,
                 trashSwipeController = trashSwipeController,
                 trashSwipeConfig = trashConfig,
                 scope = scope,
@@ -705,7 +659,7 @@ private fun ViewerBottomBar(
     currentItem: MediaItem?,
     isTrashPreview: Boolean,
     activeExoPlayer: ExoPlayer?,
-    controlsVisible: Boolean,
+    showControls: Boolean,
     trashSwipeController: PhysicsVerticalSwipeController,
     trashSwipeConfig: PhysicsVerticalSwipeConfig,
     scope: CoroutineScope,
@@ -714,6 +668,9 @@ private fun ViewerBottomBar(
     onRestore: () -> Unit,
     onPermanentDelete: () -> Unit,
 ) {
+    val controlsVisible = showControls &&
+        trashSwipeController.phase != VerticalSwipePhase.Dragging &&
+        trashSwipeController.phase != VerticalSwipePhase.Dismissed
     Surface(
         color = Color.Black,
         modifier = Modifier
@@ -748,7 +705,8 @@ private fun ViewerBottomBar(
                 isTrashPreview && currentItem.isVideo -> 164.dp
                 currentItem.isVideo -> 104.dp
                 isTrashPreview -> 68.dp
-                else -> 52.dp
+                // Only the drag handle remains for photos; the swipe hint used to reserve 52.dp.
+                else -> 12.dp
             }
 
             Box(
@@ -818,28 +776,6 @@ private fun ViewerBottomBar(
                                     Spacer(modifier = Modifier.width(8.dp))
                                     Text(stringResource(R.string.delete_permanently_action))
                                 }
-                            }
-                        } else if (!currentItem.isVideo) {
-                            Row(
-                                verticalAlignment = Alignment.CenterVertically,
-                                horizontalArrangement = Arrangement.Center,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(40.dp)
-                                    .alpha(0.65f),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.KeyboardArrowUp,
-                                    contentDescription = null,
-                                    tint = Color.White,
-                                    modifier = Modifier.size(16.dp),
-                                )
-                                Spacer(modifier = Modifier.width(4.dp))
-                                Text(
-                                    text = "Swipe up to trash",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = Color.White,
-                                )
                             }
                         }
                     }
@@ -1034,13 +970,14 @@ internal fun computeStackedUnderlyingCardTransform(
 @Composable
 private fun StackedUnderlyingCard(
     item: MediaItem,
-    offsetYProvider: () -> Float,
+    offsetY: FloatState,
     dismissDistanceThresholdPx: Float,
     modifier: Modifier = Modifier,
 ) {
     val context = LocalContext.current
     val imageLoader = rememberSweepImageLoader()
     val restingOffsetPx = with(LocalDensity.current) { 24.dp.toPx() }
+    val revealDistancePx = (dismissDistanceThresholdPx * 1.45f).coerceAtLeast(1f)
 
     val request = remember(item.id, item.contentUri, item.isVideo) {
         ImageRequest.Builder(context)
@@ -1059,14 +996,11 @@ private fun StackedUnderlyingCard(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .graphicsLayer {
-                val transform = computeStackedUnderlyingCardTransform(
-                    offsetY = offsetYProvider(),
-                    dismissDistanceThresholdPx = dismissDistanceThresholdPx,
-                    restingOffsetPx = restingOffsetPx,
-                )
-                scaleX = transform.scale
-                scaleY = transform.scale
-                translationY = transform.translationY
+                val revealProgress = (-offsetY.floatValue / revealDistancePx).coerceIn(0f, 1f)
+                val scale = 0.92f + (0.08f * revealProgress)
+                scaleX = scale
+                scaleY = scale
+                translationY = restingOffsetPx * (1f - revealProgress)
             }
             .background(Color.Black)
             .testTag("viewer_underlying_card"),
@@ -1082,12 +1016,8 @@ private fun StackedUnderlyingCard(
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    val transform = computeStackedUnderlyingCardTransform(
-                        offsetY = offsetYProvider(),
-                        dismissDistanceThresholdPx = dismissDistanceThresholdPx,
-                        restingOffsetPx = restingOffsetPx,
-                    )
-                    alpha = transform.dimAlpha
+                    val revealProgress = (-offsetY.floatValue / revealDistancePx).coerceIn(0f, 1f)
+                    alpha = 0.45f * (1f - revealProgress)
                 }
                 .background(Color.Black)
                 .testTag("viewer_underlying_dim"),

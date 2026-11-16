@@ -744,7 +744,10 @@ class PhysicsVerticalSwipeTest {
         }
         composeTestRule.waitForIdle()
 
-        composeTestRule.onNodeWithTag("viewer_trash_pill").assertIsDisplayed()
+        // The swipe instruction was removed entirely: no static hint and no drag pill.
+        composeTestRule.onNodeWithTag("viewer_trash_pill").assertDoesNotExist()
+        composeTestRule.onNodeWithText("Swipe up to trash").assertDoesNotExist()
+        composeTestRule.onNodeWithText("Release to move to trash").assertDoesNotExist()
         val draggedActiveRightBounds = composeTestRule.onNodeWithTag("viewer_media_card").getUnclippedBoundsInRoot()
         val draggedUnderlyingBounds = composeTestRule.onNodeWithTag("viewer_underlying_card").getUnclippedBoundsInRoot()
         assertTrue(

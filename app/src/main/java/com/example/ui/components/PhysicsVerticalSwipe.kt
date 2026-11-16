@@ -1,20 +1,24 @@
 package com.example.ui.components
 
-import androidx.compose.animation.core.Animatable
-import androidx.compose.animation.core.AnimationEndReason
-import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.SpringSpec
+import androidx.compose.animation.core.TargetBasedAnimation
+import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.FloatState
 import androidx.compose.runtime.Immutable
+import androidx.compose.runtime.MutableFloatState
 import androidx.compose.runtime.Stable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -133,8 +137,17 @@ class PhysicsVerticalSwipeController(
     initialOffsetY: Float = 0f,
     initialPhase: VerticalSwipePhase = VerticalSwipePhase.Idle,
 ) {
-    val offsetY: Animatable<Float, AnimationVector1D> = Animatable(initialOffsetY)
-    val offsetX: Animatable<Float, AnimationVector1D> = Animatable(0f)
+    private val offsetYState: MutableFloatState = mutableFloatStateOf(initialOffsetY)
+    private val offsetXState: MutableFloatState = mutableFloatStateOf(0f)
+
+    /**
+     * Backed by snapshot state, but written directly from the pointer-event coroutine and read
+     * from [androidx.compose.ui.graphics.graphicsLayer] blocks. This keeps dragging synchronous
+     * with input and limits gesture-driven invalidation to the draw phase (no recomposition or
+     * layout). [FloatState] also avoids boxing on the animation hot path.
+     */
+    val offsetY: FloatState = offsetYState
+    val offsetX: FloatState = offsetXState
 
     var phase by mutableStateOf(initialPhase)
         private set
@@ -143,13 +156,13 @@ class PhysicsVerticalSwipeController(
         private set
 
     val currentOffsetY: Float
-        get() = offsetY.value
+        get() = offsetYState.floatValue
 
     val currentOffsetX: Float
-        get() = offsetX.value
+        get() = offsetXState.floatValue
 
     val isRunning: Boolean
-        get() = offsetY.isRunning || offsetX.isRunning
+        get() = activeAnimationJob?.isActive == true
 
     private var gestureGeneration: Long = 0L
     private var dispatchedDismissGeneration: Long = -1L
@@ -159,37 +172,39 @@ class PhysicsVerticalSwipeController(
         axisLock = lock
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun beginOrResumeDrag(scope: CoroutineScope) {
+        // Cancelling is enough to stop the spring on its next frame. The generation token makes
+        // sure a frame already in flight can never overwrite the new drag position.
         activeAnimationJob?.cancel()
         activeAnimationJob = null
-        scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            offsetY.stop()
-            offsetX.stop()
-        }
         gestureGeneration++
         axisLock = GestureAxisLock.Vertical
         phase = VerticalSwipePhase.Dragging
     }
 
+    /**
+     * Applies a drag delta synchronously. Do not launch a coroutine here: move events can arrive on
+     * every display frame and allocating/dispatching a job per event adds input latency and GC
+     * churn while making the card lag behind the finger.
+     */
+    @Suppress("UNUSED_PARAMETER")
     fun dragBy(
         scope: CoroutineScope,
         deltaY: Float,
         config: PhysicsVerticalSwipeConfig,
         deltaX: Float = 0f,
     ) {
-        val currentY = offsetY.value
-        val nextY = computeNextOffset(currentY, deltaY, config)
+        offsetYState.floatValue = computeNextOffset(currentOffsetY, deltaY, config)
+
         val nextX = if (config.maxHorizontalDriftPx > 0f) {
-            (offsetX.value + deltaX * config.horizontalDriftDamping)
+            (currentOffsetX + deltaX * config.horizontalDriftDamping)
                 .coerceIn(-config.maxHorizontalDriftPx, config.maxHorizontalDriftPx)
         } else {
             0f
         }
-        scope.launch(start = CoroutineStart.UNDISPATCHED) {
-            offsetY.snapTo(nextY)
-            if (config.maxHorizontalDriftPx > 0f || offsetX.value != 0f) {
-                offsetX.snapTo(nextX)
-            }
+        if (offsetXState.floatValue != nextX) {
+            offsetXState.floatValue = nextX
         }
     }
 
@@ -264,39 +279,41 @@ class PhysicsVerticalSwipeController(
         onDismissed: () -> Unit,
         onSettledRestored: (() -> Unit)? = null,
     ) {
-        val token = gestureGeneration
-        val dismiss = shouldDismissOnRelease(offsetY.value, velocityY, config)
+        val dismiss = shouldDismissOnRelease(currentOffsetY, velocityY, config)
         activeAnimationJob?.cancel()
-        activeAnimationJob = scope.launch {
+        val token = ++gestureGeneration
+        activeAnimationJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
             if (dismiss) {
                 val targetY = if (direction == VerticalSwipeDirection.UpToDismiss) {
                     -config.dismissTargetOffsetPx
                 } else {
                     config.dismissTargetOffsetPx
                 }
+                val dismissSpec = spring<Float>(
+                    dampingRatio = config.dismissDampingRatio,
+                    stiffness = config.dismissStiffness,
+                )
                 if (config.maxHorizontalDriftPx > 0f) {
-                    val targetX = (offsetX.value + velocityX * 0.08f)
+                    val targetX = (currentOffsetX + velocityX * 0.08f)
                         .coerceIn(-config.maxHorizontalDriftPx * 1.4f, config.maxHorizontalDriftPx * 1.4f)
                     launch {
-                        offsetX.animateTo(
+                        animateAxisToTarget(
+                            state = offsetXState,
                             targetValue = targetX,
                             initialVelocity = velocityX * 0.5f,
-                            animationSpec = spring(
-                                dampingRatio = config.dismissDampingRatio,
-                                stiffness = config.dismissStiffness,
-                            ),
+                            animationSpec = dismissSpec,
+                            generation = token,
                         )
                     }
                 }
-                val result = offsetY.animateTo(
+                animateAxisToTarget(
+                    state = offsetYState,
                     targetValue = targetY,
                     initialVelocity = velocityY,
-                    animationSpec = spring(
-                        dampingRatio = config.dismissDampingRatio,
-                        stiffness = config.dismissStiffness,
-                    ),
+                    animationSpec = dismissSpec,
+                    generation = token,
                 )
-                if (result.endReason == AnimationEndReason.Finished && gestureGeneration == token) {
+                if (gestureGeneration == token) {
                     phase = VerticalSwipePhase.Dismissed
                     if (dispatchedDismissGeneration != token) {
                         dispatchedDismissGeneration = token
@@ -304,27 +321,29 @@ class PhysicsVerticalSwipeController(
                     }
                 }
             } else {
-                if (offsetX.value != 0f || velocityX != 0f) {
+                val settleSpec = spring<Float>(
+                    dampingRatio = config.settleDampingRatio,
+                    stiffness = config.settleStiffness,
+                )
+                if (offsetXState.floatValue != 0f || velocityX != 0f) {
                     launch {
-                        offsetX.animateTo(
+                        animateAxisToTarget(
+                            state = offsetXState,
                             targetValue = 0f,
                             initialVelocity = velocityX * 0.5f,
-                            animationSpec = spring(
-                                dampingRatio = config.settleDampingRatio,
-                                stiffness = config.settleStiffness,
-                            ),
+                            animationSpec = settleSpec,
+                            generation = token,
                         )
                     }
                 }
-                val result = offsetY.animateTo(
+                animateAxisToTarget(
+                    state = offsetYState,
                     targetValue = 0f,
                     initialVelocity = velocityY,
-                    animationSpec = spring(
-                        dampingRatio = config.settleDampingRatio,
-                        stiffness = config.settleStiffness,
-                    ),
+                    animationSpec = settleSpec,
+                    generation = token,
                 )
-                if (result.endReason == AnimationEndReason.Finished && gestureGeneration == token) {
+                if (gestureGeneration == token) {
                     phase = restPhase
                     onSettledRestored?.invoke()
                 }
@@ -341,27 +360,30 @@ class PhysicsVerticalSwipeController(
     ) {
         activeAnimationJob?.cancel()
         val token = ++gestureGeneration
-        activeAnimationJob = scope.launch {
-            if (offsetX.value != 0f) {
+        activeAnimationJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            val settleSpec = spring<Float>(
+                dampingRatio = config.settleDampingRatio,
+                stiffness = config.settleStiffness,
+            )
+            if (offsetXState.floatValue != 0f) {
                 launch {
-                    offsetX.animateTo(
+                    animateAxisToTarget(
+                        state = offsetXState,
                         targetValue = 0f,
-                        animationSpec = spring(
-                            dampingRatio = config.settleDampingRatio,
-                            stiffness = config.settleStiffness,
-                        ),
+                        initialVelocity = 0f,
+                        animationSpec = settleSpec,
+                        generation = token,
                     )
                 }
             }
-            val result = offsetY.animateTo(
+            animateAxisToTarget(
+                state = offsetYState,
                 targetValue = 0f,
                 initialVelocity = initialVelocity,
-                animationSpec = spring(
-                    dampingRatio = config.settleDampingRatio,
-                    stiffness = config.settleStiffness,
-                ),
+                animationSpec = settleSpec,
+                generation = token,
             )
-            if (result.endReason == AnimationEndReason.Finished && gestureGeneration == token) {
+            if (gestureGeneration == token) {
                 phase = restPhase
                 onSettledRestored?.invoke()
             }
@@ -374,7 +396,7 @@ class PhysicsVerticalSwipeController(
         initialVelocity: Float = 0f,
         onDismissed: () -> Unit,
     ) {
-        if (phase == VerticalSwipePhase.Dismissed && !offsetY.isRunning) {
+        if (phase == VerticalSwipePhase.Dismissed && !isRunning) {
             return
         }
         activeAnimationJob?.cancel()
@@ -384,16 +406,19 @@ class PhysicsVerticalSwipeController(
         } else {
             config.dismissTargetOffsetPx
         }
-        activeAnimationJob = scope.launch {
-            val result = offsetY.animateTo(
+        activeAnimationJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            val dismissSpec = spring<Float>(
+                dampingRatio = config.dismissDampingRatio,
+                stiffness = config.dismissStiffness,
+            )
+            animateAxisToTarget(
+                state = offsetYState,
                 targetValue = target,
                 initialVelocity = initialVelocity,
-                animationSpec = spring(
-                    dampingRatio = config.dismissDampingRatio,
-                    stiffness = config.dismissStiffness,
-                ),
+                animationSpec = dismissSpec,
+                generation = token,
             )
-            if (result.endReason == AnimationEndReason.Finished && gestureGeneration == token) {
+            if (gestureGeneration == token) {
                 phase = VerticalSwipePhase.Dismissed
                 if (dispatchedDismissGeneration != token) {
                     dispatchedDismissGeneration = token
@@ -408,8 +433,8 @@ class PhysicsVerticalSwipeController(
         activeAnimationJob = null
         gestureGeneration++
         dispatchedDismissGeneration = -1L
-        offsetY.snapTo(0f)
-        offsetX.snapTo(0f)
+        offsetYState.floatValue = 0f
+        offsetXState.floatValue = 0f
         axisLock = GestureAxisLock.Undecided
         phase = restPhase
     }
@@ -419,10 +444,45 @@ class PhysicsVerticalSwipeController(
         activeAnimationJob = null
         gestureGeneration++
         dispatchedDismissGeneration = -1L
-        offsetY.snapTo(offset)
-        offsetX.snapTo(0f)
+        offsetYState.floatValue = offset
+        offsetXState.floatValue = 0f
         axisLock = GestureAxisLock.Undecided
         phase = newPhase
+    }
+
+    /**
+     * Runs a spring on the Compose frame clock and writes straight into the snapshot-backed
+     * offset. No recomposition or layout pass is scheduled per frame, only a graphics-layer
+     * invalidation. The generation check makes cancellation instant even if a frame is in flight.
+     */
+    private suspend fun animateAxisToTarget(
+        state: MutableFloatState,
+        targetValue: Float,
+        initialVelocity: Float,
+        animationSpec: SpringSpec<Float>,
+        generation: Long,
+    ) {
+        val animation = TargetBasedAnimation(
+            animationSpec = animationSpec,
+            typeConverter = Float.VectorConverter,
+            initialValue = state.floatValue,
+            targetValue = targetValue,
+            initialVelocity = initialVelocity,
+        )
+        var startTimeNanos = Long.MIN_VALUE
+        while (true) {
+            val frameTimeNanos = withFrameNanos { it }
+            if (generation != gestureGeneration) return
+            if (startTimeNanos == Long.MIN_VALUE) {
+                startTimeNanos = frameTimeNanos
+            }
+            val playTimeNanos = frameTimeNanos - startTimeNanos
+            if (animation.isFinishedFromNanos(playTimeNanos)) {
+                state.floatValue = targetValue
+                return
+            }
+            state.floatValue = animation.getValueFromNanos(playTimeNanos)
+        }
     }
 }
 
@@ -495,8 +555,13 @@ fun Modifier.physicsVerticalSwipe(
                         break
                     }
 
-                    val pressedChanges = event.changes.filter { it.pressed }
-                    if (pressedChanges.size > 1) {
+                    var pressedPointerCount = 0
+                    for (index in event.changes.indices) {
+                        if (event.changes[index].pressed) {
+                            pressedPointerCount++
+                        }
+                    }
+                    if (pressedPointerCount > 1) {
                         if (engaged) {
                             settledOnExit = true
                             controller.animateToRest(
@@ -509,9 +574,20 @@ fun Modifier.physicsVerticalSwipe(
                         break
                     }
 
-                    val change = event.changes.firstOrNull { it.id == down.id }
-                        ?: event.changes.firstOrNull()
-                        ?: break
+                    var changeIndex = -1
+                    for (index in event.changes.indices) {
+                        if (event.changes[index].id == down.id) {
+                            changeIndex = index
+                            break
+                        }
+                    }
+                    if (changeIndex == -1 && event.changes.isNotEmpty()) {
+                        changeIndex = 0
+                    }
+                    if (changeIndex == -1) {
+                        break
+                    }
+                    val change = event.changes[changeIndex]
 
                     if (!change.pressed) {
                         if (engaged) {
