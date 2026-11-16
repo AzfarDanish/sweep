@@ -1,0 +1,6 @@
+{
+  "name": "Sweep",
+  "description": "Offline-first Android media manager and cleanup app with gesture-based swipe-to-trash viewer, timeline, albums, and SAF file browser.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
