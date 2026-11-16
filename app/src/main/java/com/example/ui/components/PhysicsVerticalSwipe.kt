@@ -278,8 +278,24 @@ class PhysicsVerticalSwipeController(
         restPhase: VerticalSwipePhase = VerticalSwipePhase.Idle,
         onDismissed: () -> Unit,
         onSettledRestored: (() -> Unit)? = null,
+        onDismissCommit: ((offsetY: Float, velocityY: Float) -> Unit)? = null,
     ) {
         val dismiss = shouldDismissOnRelease(currentOffsetY, velocityY, config)
+        if (dismiss && onDismissCommit != null) {
+            val releasedOffsetY = currentOffsetY
+            activeAnimationJob?.cancel()
+            activeAnimationJob = null
+            val token = ++gestureGeneration
+            offsetYState.floatValue = 0f
+            offsetXState.floatValue = 0f
+            axisLock = GestureAxisLock.Undecided
+            phase = restPhase
+            if (dispatchedDismissGeneration != token) {
+                dispatchedDismissGeneration = token
+                onDismissCommit(releasedOffsetY, velocityY)
+            }
+            return
+        }
         activeAnimationJob?.cancel()
         val token = ++gestureGeneration
         activeAnimationJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
@@ -428,7 +444,7 @@ class PhysicsVerticalSwipeController(
         }
     }
 
-    suspend fun snapToRest(restPhase: VerticalSwipePhase = VerticalSwipePhase.Idle) {
+    fun snapToRestSync(restPhase: VerticalSwipePhase = VerticalSwipePhase.Idle) {
         activeAnimationJob?.cancel()
         activeAnimationJob = null
         gestureGeneration++
@@ -437,6 +453,10 @@ class PhysicsVerticalSwipeController(
         offsetXState.floatValue = 0f
         axisLock = GestureAxisLock.Undecided
         phase = restPhase
+    }
+
+    suspend fun snapToRest(restPhase: VerticalSwipePhase = VerticalSwipePhase.Idle) {
+        snapToRestSync(restPhase)
     }
 
     suspend fun snapToOffset(offset: Float, newPhase: VerticalSwipePhase) {
@@ -498,11 +518,13 @@ fun Modifier.physicsVerticalSwipe(
     pointerPass: PointerEventPass = PointerEventPass.Main,
     onDismissed: () -> Unit,
     onSettledRestored: (() -> Unit)? = null,
+    onDismissCommit: ((offsetY: Float, velocityY: Float) -> Unit)? = null,
 ): Modifier = composed {
     val latestConfig by rememberUpdatedState(config)
     val latestCanEngage by rememberUpdatedState(canEngage)
     val latestOnDismissed by rememberUpdatedState(onDismissed)
     val latestOnSettledRestored by rememberUpdatedState(onSettledRestored)
+    val latestOnDismissCommit by rememberUpdatedState(onDismissCommit)
 
     if (!enabled) {
         return@composed this
@@ -602,6 +624,7 @@ fun Modifier.physicsVerticalSwipe(
                                 restPhase = restPhase,
                                 onDismissed = latestOnDismissed,
                                 onSettledRestored = latestOnSettledRestored,
+                                onDismissCommit = latestOnDismissCommit,
                             )
                         }
                         break

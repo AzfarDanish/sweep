@@ -1,5 +1,6 @@
 package com.example
 
+import android.content.Context
 import android.net.Uri
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
@@ -30,6 +31,8 @@ import androidx.compose.ui.test.swipeLeft
 import androidx.compose.ui.test.swipeRight
 import androidx.compose.ui.test.swipeUp
 import androidx.compose.ui.unit.dp
+import androidx.test.core.app.ApplicationProvider
+import coil.size.Precision
 import com.example.data.UndoRedoUiState
 import com.example.model.MediaItem
 import com.example.ui.components.GestureAxisLock
@@ -40,6 +43,7 @@ import com.example.ui.components.VerticalSwipePhase
 import com.example.ui.components.physicsVerticalSwipe
 import com.example.ui.components.rememberPhysicsVerticalSwipeConfig
 import com.example.ui.screens.MediaViewerScreen
+import com.example.ui.screens.buildViewerImageRequest
 import com.example.ui.screens.computeStackedActiveCardTransform
 import com.example.ui.screens.computeStackedUnderlyingCardTransform
 import com.example.ui.theme.SweepTheme
@@ -1098,5 +1102,227 @@ class PhysicsVerticalSwipeTest {
 
         assertEquals(listOf(1L), trashed.map { it.id })
         composeTestRule.onNodeWithText("1 / 2").assertIsDisplayed()
+    }
+
+    @Test
+    fun `20_fast_swipe_commits_immediately_and_runs_outgoing_and_incoming_concurrently`() {
+        val trashed = mutableListOf<MediaItem>()
+        composeTestRule.setContent {
+            SweepTheme {
+                var items by remember { mutableStateOf(sampleItems(3)) }
+                MediaViewerScreen(
+                    items = items,
+                    initialMediaId = 1L,
+                    isTrashPreview = false,
+                    trashCount = trashed.size,
+                    undoRedoState = UndoRedoUiState(),
+                    onBack = {},
+                    onOpenTrash = {},
+                    onTrashItem = { item ->
+                        trashed.add(item)
+                        items = items.filterNot { it.id == item.id }
+                    },
+                    onRestoreItem = {},
+                    onPermanentDeleteItem = {},
+                    onUndo = {},
+                    onRedo = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        composeTestRule.mainClock.autoAdvance = false
+
+        // Perform a fast short upward flick and release
+        composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
+            swipeUp(
+                startY = centerY,
+                endY = centerY - 240f,
+                durationMillis = 35L,
+            )
+        }
+        // Advance only 16ms (single frame): trash must already be committed, outgoing overlay active,
+        // and next item staged cleanly without waiting ~300ms for exit spring completion.
+        composeTestRule.mainClock.advanceTimeBy(16L)
+
+        assertEquals(listOf(1L), trashed.map { it.id })
+        composeTestRule.onNodeWithTag("viewer_exiting_card_1").assertExists()
+        composeTestRule.onNodeWithText("1 / 2").assertIsDisplayed()
+
+        // Let outgoing exit and incoming expansion finish cleanly
+        composeTestRule.mainClock.autoAdvance = true
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithTag("viewer_exiting_card_1").assertDoesNotExist()
+        assertEquals(listOf(1L), trashed.map { it.id })
+    }
+
+    @Test
+    fun `21_rapid_consecutive_fast_swipes_trash_distinct_items_without_duplicates_or_blocking`() {
+        val trashed = mutableListOf<MediaItem>()
+        composeTestRule.setContent {
+            SweepTheme {
+                var items by remember { mutableStateOf(sampleItems(5)) }
+                MediaViewerScreen(
+                    items = items,
+                    initialMediaId = 1L,
+                    isTrashPreview = false,
+                    trashCount = trashed.size,
+                    undoRedoState = UndoRedoUiState(),
+                    onBack = {},
+                    onOpenTrash = {},
+                    onTrashItem = { item ->
+                        trashed.add(item)
+                        items = items.filterNot { it.id == item.id }
+                    },
+                    onRestoreItem = {},
+                    onPermanentDeleteItem = {},
+                    onUndo = {},
+                    onRedo = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        composeTestRule.mainClock.autoAdvance = false
+
+        // Rapidly swipe 4 items back-to-back with only 32ms between flicks (while previous exits are still mid-flight)
+        repeat(4) { step ->
+            composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
+                swipeUp(
+                    startY = centerY,
+                    endY = centerY - 260f,
+                    durationMillis = 32L,
+                )
+            }
+            composeTestRule.mainClock.advanceTimeBy(32L)
+            assertEquals(step + 1, trashed.size)
+        }
+
+        composeTestRule.mainClock.autoAdvance = true
+        composeTestRule.waitForIdle()
+
+        assertEquals(listOf(1L, 2L, 3L, 4L), trashed.map { it.id })
+        composeTestRule.onNodeWithText("1 / 1").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("viewer_underlying_card").assertDoesNotExist()
+    }
+
+    @Test
+    fun `22_layered_photo_presentation_renders_full_bounds_backdrop_and_centered_foreground_for_portrait_and_landscape`() {
+        val mixedItems = listOf(
+            sampleItems(1).first().copy(id = 10L, width = 900, height = 1600, displayName = "portrait.jpg"),
+            sampleItems(1).first().copy(id = 20L, width = 1920, height = 1080, displayName = "landscape.jpg"),
+        )
+        val trashed = mutableListOf<MediaItem>()
+
+        composeTestRule.setContent {
+            SweepTheme {
+                var items by remember { mutableStateOf(mixedItems) }
+                MediaViewerScreen(
+                    items = items,
+                    initialMediaId = 10L,
+                    isTrashPreview = false,
+                    trashCount = trashed.size,
+                    undoRedoState = UndoRedoUiState(),
+                    onBack = {},
+                    onOpenTrash = {},
+                    onTrashItem = { item ->
+                        trashed.add(item)
+                        items = items.filterNot { it.id == item.id }
+                    },
+                    onRestoreItem = {},
+                    onPermanentDeleteItem = {},
+                    onUndo = {},
+                    onRedo = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        val viewportBounds = composeTestRule.onNodeWithTag("viewer_media_viewport").getUnclippedBoundsInRoot()
+        val portraitBackdrop = composeTestRule.onNodeWithTag("viewer_photo_backdrop_10").getUnclippedBoundsInRoot()
+        val portraitForeground = composeTestRule.onNodeWithTag("viewer_photo_foreground_10").getUnclippedBoundsInRoot()
+
+        assertEquals(viewportBounds.left.value, portraitBackdrop.left.value, 1f)
+        assertEquals(viewportBounds.top.value, portraitBackdrop.top.value, 1f)
+        assertEquals(viewportBounds.right.value, portraitBackdrop.right.value, 1f)
+        assertEquals(viewportBounds.bottom.value, portraitBackdrop.bottom.value, 1f)
+        assertEquals(viewportBounds.left.value, portraitForeground.left.value, 1f)
+        assertEquals(viewportBounds.top.value, portraitForeground.top.value, 1f)
+        assertEquals(viewportBounds.right.value, portraitForeground.right.value, 1f)
+        assertEquals(viewportBounds.bottom.value, portraitForeground.bottom.value, 1f)
+
+        // Underlying landscape item also stages layered backdrop + foreground
+        composeTestRule.onNodeWithTag("viewer_underlying_backdrop_20").assertExists()
+        composeTestRule.onNodeWithTag("viewer_underlying_foreground_20").assertExists()
+
+        // Swipe portrait item away -> landscape item becomes active with its layered backdrop + foreground
+        composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
+            swipeUp(startY = centerY, endY = top + 40f, durationMillis = 90L)
+        }
+        composeTestRule.waitForIdle()
+
+        val landscapeBackdrop = composeTestRule.onNodeWithTag("viewer_photo_backdrop_20").getUnclippedBoundsInRoot()
+        val landscapeForeground = composeTestRule.onNodeWithTag("viewer_photo_foreground_20").getUnclippedBoundsInRoot()
+        assertEquals(viewportBounds.left.value, landscapeBackdrop.left.value, 1f)
+        assertEquals(viewportBounds.top.value, landscapeBackdrop.top.value, 1f)
+        assertEquals(viewportBounds.right.value, landscapeBackdrop.right.value, 1f)
+        assertEquals(viewportBounds.bottom.value, landscapeBackdrop.bottom.value, 1f)
+        assertEquals(viewportBounds.left.value, landscapeForeground.left.value, 1f)
+        assertEquals(viewportBounds.top.value, landscapeForeground.top.value, 1f)
+        assertEquals(viewportBounds.right.value, landscapeForeground.right.value, 1f)
+        assertEquals(viewportBounds.bottom.value, landscapeForeground.bottom.value, 1f)
+    }
+
+    @Test
+    fun `23_trashing_last_item_shifts_cleanly_without_empty_flash_and_viewer_request_shares_cache_spec`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val photoItem = sampleItems(1).first()
+        val videoItem = photoItem.copy(id = 99L, isVideo = true)
+
+        val photoReqA = buildViewerImageRequest(context, photoItem)
+        val photoReqB = buildViewerImageRequest(context, photoItem)
+        assertEquals(photoReqA.data, photoReqB.data)
+        assertEquals(Precision.INEXACT, photoReqA.precision)
+
+        val videoReq = buildViewerImageRequest(context, videoItem)
+        assertEquals(videoItem.contentUri, videoReq.data)
+        assertEquals(Precision.INEXACT, videoReq.precision)
+
+        val trashed = mutableListOf<MediaItem>()
+        composeTestRule.setContent {
+            SweepTheme {
+                var items by remember { mutableStateOf(sampleItems(2)) }
+                MediaViewerScreen(
+                    items = items,
+                    initialMediaId = 2L,
+                    isTrashPreview = false,
+                    trashCount = trashed.size,
+                    undoRedoState = UndoRedoUiState(),
+                    onBack = {},
+                    onOpenTrash = {},
+                    onTrashItem = { item ->
+                        trashed.add(item)
+                        items = items.filterNot { it.id == item.id }
+                    },
+                    onRestoreItem = {},
+                    onPermanentDeleteItem = {},
+                    onUndo = {},
+                    onRedo = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("2 / 2").assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
+            swipeUp(startY = centerY, endY = top + 40f, durationMillis = 80L)
+        }
+        composeTestRule.waitForIdle()
+
+        assertEquals(listOf(2L), trashed.map { it.id })
+        composeTestRule.onNodeWithText("1 / 1").assertIsDisplayed()
+        composeTestRule.onNodeWithText("No media remaining").assertDoesNotExist()
     }
 }

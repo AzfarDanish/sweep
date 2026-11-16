@@ -34,6 +34,8 @@ import kotlinx.coroutines.flow.debounce
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 
 enum class PendingOperationType {
     TRASH,
@@ -104,6 +106,8 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
     private var activePendingOp: PendingIntentOperation? = null
     private var mediaScanJob: Job? = null
     private val viewerRemovedHistory = LinkedHashMap<Uri, Pair<Int, MediaItem>>()
+    private val pendingViewerTrashUris = HashSet<Uri>()
+    private val trashMutex = Mutex()
 
     private val baseFlow = combine(
         _permissionState,
@@ -249,27 +253,46 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
 
     fun requestTrash(uris: List<Uri>, fromViewer: Boolean = false) {
         if (uris.isEmpty()) return
-        viewModelScope.launch {
-            val moved = repository.moveToTrashImmediate(uris)
-            if (moved.isEmpty()) {
-                loadMediaInternal(showSpinner = false)
-                return@launch
-            }
+        val targetUris = if (fromViewer) {
+            uris.filter { pendingViewerTrashUris.add(it) }
+        } else {
+            uris.distinct()
+        }
+        if (targetUris.isEmpty()) return
 
-            if (fromViewer) {
-                val currentViewerList = _viewerItems.value
-                moved.forEach { uri ->
-                    val idx = currentViewerList.indexOfFirst { it.contentUri == uri }
-                    if (idx >= 0) {
-                        viewerRemovedHistory[uri] = idx to currentViewerList[idx]
+        if (fromViewer) {
+            val currentViewerList = _viewerItems.value
+            targetUris.forEach { uri ->
+                val idx = currentViewerList.indexOfFirst { it.contentUri == uri }
+                if (idx >= 0) {
+                    viewerRemovedHistory[uri] = idx to currentViewerList[idx]
+                }
+            }
+            val targetSet = targetUris.toSet()
+            _viewerItems.update { list -> list.filterNot { it.contentUri in targetSet } }
+            _selectedUris.value = emptySet()
+        }
+
+        viewModelScope.launch {
+            trashMutex.withLock {
+                try {
+                    val moved = repository.moveToTrashImmediate(targetUris)
+                    if (moved.isEmpty()) {
+                        loadMediaInternal(showSpinner = false)
+                        return@launch
+                    }
+
+                    undoRedoManager.recordNewAction(TrashAction.MoveToTrash(moved))
+                    if (!fromViewer) {
+                        _selectedUris.value = emptySet()
+                    }
+                    loadMediaInternal(showSpinner = false)
+                } finally {
+                    if (fromViewer) {
+                        pendingViewerTrashUris.removeAll(targetUris.toSet())
                     }
                 }
-                _viewerItems.update { list -> list.filterNot { it.contentUri in moved } }
             }
-
-            undoRedoManager.recordNewAction(TrashAction.MoveToTrash(moved))
-            _selectedUris.value = emptySet()
-            loadMediaInternal(showSpinner = false)
         }
     }
 
