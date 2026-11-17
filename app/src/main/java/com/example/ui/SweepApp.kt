@@ -66,6 +66,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.toRoute
 import com.example.R
+import com.example.model.AlbumSortOption
 import com.example.ui.navigation.AlbumDetailRoute
 import com.example.ui.navigation.AlbumsRoute
 import com.example.ui.navigation.FilesRoute
@@ -390,10 +391,9 @@ fun SweepApp(
                         onTrashSelected = {
                             mediaViewModel.requestTrash(mediaUiState.selectedUris.toList())
                         },
-                        onUndo = mediaViewModel::triggerUndo,
-                        onRedo = mediaViewModel::triggerRedo,
                         onRequestPermission = requestMediaAccess,
                         onOpenSettings = openAppSettings,
+                        onSelectUris = mediaViewModel::selectUris,
                     )
                 }
 
@@ -407,12 +407,24 @@ fun SweepApp(
                         },
                         onRequestPermission = requestMediaAccess,
                         onOpenSettings = openAppSettings,
+                        onOpenTrash = {
+                            mediaViewModel.clearSelection()
+                            navController.navigate(TrashRoute)
+                        },
                     )
                 }
 
                 composable<MonthDetailRoute> { entry ->
                     val route = entry.toRoute<MonthDetailRoute>()
-                    val monthItems = remember(mediaUiState.allMedia, route.year, route.month) {
+                    val monthKey = "${route.year}_${route.month}"
+                    val selectedSort = mediaUiState.monthSortOptions[monthKey]
+                        ?: AlbumSortOption.NEWEST_FIRST
+                    val monthItems = remember(
+                        mediaUiState.allMedia,
+                        route.year,
+                        route.month,
+                        selectedSort,
+                    ) {
                         mediaViewModel.getMonthItems(route.year, route.month)
                     }
                     MonthDetailScreen(
@@ -421,6 +433,10 @@ fun SweepApp(
                         items = monthItems,
                         selectedUris = mediaUiState.selectedUris,
                         gridColumns = gridColumns,
+                        selectedSort = selectedSort,
+                        onSortChange = { option ->
+                            mediaViewModel.setMonthSortOption(route.year, route.month, option)
+                        },
                         onBack = {
                             mediaViewModel.clearSelection()
                             navController.popBackStack()
@@ -435,6 +451,7 @@ fun SweepApp(
                         onTrashSelected = {
                             mediaViewModel.requestTrash(mediaUiState.selectedUris.toList())
                         },
+                        onSelectUris = mediaViewModel::selectUris,
                     )
                 }
 
@@ -448,6 +465,10 @@ fun SweepApp(
                         },
                         onRequestPermission = requestMediaAccess,
                         onOpenSettings = openAppSettings,
+                        onOpenTrash = {
+                            mediaViewModel.clearSelection()
+                            navController.navigate(TrashRoute)
+                        },
                     )
                 }
 
@@ -457,7 +478,7 @@ fun SweepApp(
                         mediaUiState.albums.firstOrNull { it.id == route.albumId }
                     }
                     val selectedSort = mediaUiState.albumSortOptions[route.albumId]
-                        ?: com.example.model.AlbumSortOption.OLDEST_FIRST
+                        ?: AlbumSortOption.NEWEST_FIRST
                     AlbumDetailScreen(
                         album = album,
                         selectedUris = mediaUiState.selectedUris,
@@ -480,6 +501,7 @@ fun SweepApp(
                         onTrashSelected = {
                             mediaViewModel.requestTrash(mediaUiState.selectedUris.toList())
                         },
+                        onSelectUris = mediaViewModel::selectUris,
                     )
                 }
 
@@ -535,6 +557,7 @@ fun SweepApp(
                         onPermanentDeleteUris = { uris ->
                             mediaViewModel.requestPermanentDelete(uris)
                         },
+                        onSelectUris = mediaViewModel::selectUris,
                     )
                 }
 

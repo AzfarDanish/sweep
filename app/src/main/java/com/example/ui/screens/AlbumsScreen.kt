@@ -50,6 +50,7 @@ import com.example.R
 import com.example.model.AlbumCollection
 import com.example.model.AlbumKind
 import com.example.model.PermissionAccessState
+import com.example.ui.components.HeaderTrashButton
 import com.example.ui.components.PermissionGateView
 import com.example.ui.components.rememberSweepImageLoader
 import com.example.ui.state.MediaLibraryUiState
@@ -63,6 +64,7 @@ fun AlbumsScreen(
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    onOpenTrash: () -> Unit = {},
 ) {
     val imageLoader = rememberSweepImageLoader()
     val logicalCollections = uiState.albums.filter { it.kind == AlbumKind.LOGICAL }
@@ -82,6 +84,14 @@ fun AlbumsScreen(
                         Text(
                             text = stringResource(R.string.nav_albums),
                             style = MaterialTheme.typography.headlineMedium,
+                        )
+                    },
+                    actions = {
+                        HeaderTrashButton(
+                            trashCount = uiState.trashedMedia.size,
+                            onClick = onOpenTrash,
+                            buttonTestTag = "albums_trash_button",
+                            badgeTestTag = "albums_trash_badge",
                         )
                     },
                 )

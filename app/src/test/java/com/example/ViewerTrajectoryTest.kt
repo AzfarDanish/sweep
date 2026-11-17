@@ -215,9 +215,11 @@ class ViewerTrajectoryTest {
 
             var startDist = Float.MAX_VALUE
             var minDist = Float.MAX_VALUE
-            repeat(28) {
+            var midFlightObserved = false
+            repeat(38) { frame ->
                 val nodes = composeTestRule.onAllNodes(hasTestTag(overlayTag)).fetchSemanticsNodes()
                 if (nodes.isNotEmpty()) {
+                    if (frame >= 10) midFlightObserved = true
                     val b = nodes.first().boundsInRoot
                     val topCenter = Offset((b.left + b.right) * 0.5f, b.top)
                     val dist = hypot(
@@ -230,6 +232,10 @@ class ViewerTrajectoryTest {
                 composeTestRule.mainClock.advanceTimeBy(16L)
             }
 
+            assertTrue(
+                "Exiting card ${item.id} should animate cleanly past 160ms rather than snapping",
+                midFlightObserved,
+            )
             assertTrue(
                 "Item ${item.id} (${item.width}x${item.height}, fast=$useFastFlick) must converge toward trash center (start=$startDist, min=$minDist)",
                 minDist < startDist * 0.25f && minDist < 54f,

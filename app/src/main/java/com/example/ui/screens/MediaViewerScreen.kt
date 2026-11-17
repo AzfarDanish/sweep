@@ -52,8 +52,6 @@ import androidx.compose.material.icons.outlined.PhotoAlbum
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.RestoreFromTrash
 import androidx.compose.material3.AlertDialog
-import androidx.compose.material3.Badge
-import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -132,6 +130,7 @@ import com.example.data.UndoRedoUiState
 import com.example.model.AlbumCollection
 import com.example.model.AlbumKind
 import com.example.model.MediaItem
+import com.example.ui.components.HeaderTrashButton
 import com.example.ui.components.MediaInfoSheet
 import com.example.ui.components.PermanentDeleteDialog
 import com.example.ui.components.PhysicsVerticalSwipeConfig
@@ -142,8 +141,6 @@ import com.example.ui.components.ViewerImageRequestParameter
 import com.example.ui.components.physicsVerticalSwipe
 import com.example.ui.components.rememberPhysicsVerticalSwipeConfig
 import com.example.ui.components.rememberSweepImageLoader
-import com.example.ui.theme.SweepBadgeRed
-import com.example.ui.theme.SweepBadgeWhite
 import com.example.util.Formatters
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -158,7 +155,9 @@ import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 private const val MaxExitingCards = 3
-private const val ViewerPrefetchMaxHandles = 6
+private const val ViewerPrefetchMaxHandles = 8
+private const val ViewerTransitionStiffness = 260f
+private const val ViewerTransitionVisibilityThreshold = 0.003f
 
 
 private class IncrementingCounter {
@@ -185,8 +184,8 @@ private class ViewerPrefetchCache {
     ) {
         if (items.isEmpty()) return
 
-        val window = ArrayList<MediaItem>(4)
-        for (offset in intArrayOf(0, 1, 2, -1)) {
+        val window = ArrayList<MediaItem>(5)
+        for (offset in intArrayOf(0, 1, 2, 3, -1)) {
             val item = items.getOrNull(page + offset) ?: continue
             if (window.none { it.id == item.id }) {
                 window.add(item)
@@ -296,7 +295,7 @@ fun MediaViewerScreen(
 
     LaunchedEffect(awaitingUndoRestore) {
         if (awaitingUndoRestore) {
-            delay(800L)
+            delay(1_200L)
             awaitingUndoRestore = false
         }
     }
@@ -585,7 +584,8 @@ fun MediaViewerScreen(
                     val anim = TargetBasedAnimation(
                         animationSpec = spring(
                             dampingRatio = Spring.DampingRatioNoBouncy,
-                            stiffness = Spring.StiffnessMediumLow,
+                            stiffness = ViewerTransitionStiffness,
+                            visibilityThreshold = ViewerTransitionVisibilityThreshold,
                         ),
                         typeConverter = Float.VectorConverter,
                         initialValue = revealAtHandoff,
@@ -1060,56 +1060,18 @@ private fun ViewerTopHeader(
             }
         }
 
-        IconButton(
+        HeaderTrashButton(
+            trashCount = trashCount,
             onClick = onOpenTrash,
-            modifier = Modifier
-                .align(Alignment.CenterEnd)
-                .minimumInteractiveComponentSize()
-                .testTag("viewer_trash_button"),
-        ) {
-            BadgedBox(
-                badge = {
-                    if (trashCount > 0) {
-                        Badge(
-                            containerColor = SweepBadgeRed,
-                            contentColor = SweepBadgeWhite,
-                            modifier = Modifier
-                                .graphicsLayer {
-                                    val s = badgeScale.value
-                                    scaleX = s
-                                    scaleY = s
-                                }
-                                .testTag("viewer_trash_badge"),
-                        ) {
-                            Text(
-                                text = if (trashCount > 99) "99+" else trashCount.toString(),
-                                style = MaterialTheme.typography.labelSmall.copy(
-                                    fontWeight = FontWeight.SemiBold,
-                                ),
-                            )
-                        }
-                    }
-                },
-            ) {
-                Icon(
-                    imageVector = Icons.Outlined.DeleteOutline,
-                    contentDescription = if (trashCount > 0) {
-                        stringResource(R.string.trash_bin_count_cd, trashCount)
-                    } else {
-                        stringResource(R.string.trash_bin_empty_cd)
-                    },
-                    tint = if (trashCount > 0) Color.White else Color.White.copy(alpha = 0.72f),
-                    modifier = Modifier
-                        .onGloballyPositioned(onTrashIconPositioned)
-                        .graphicsLayer {
-                            val s = iconScale.value
-                            scaleX = s
-                            scaleY = s
-                        }
-                        .testTag("viewer_trash_icon"),
-                )
-            }
-        }
+            buttonTestTag = "viewer_trash_button",
+            iconTestTag = "viewer_trash_icon",
+            badgeTestTag = "viewer_trash_badge",
+            iconTint = if (trashCount > 0) Color.White else Color.White.copy(alpha = 0.72f),
+            iconScale = iconScale.value,
+            badgeScale = badgeScale.value,
+            onIconPositioned = onTrashIconPositioned,
+            modifier = Modifier.align(Alignment.CenterEnd),
+        )
     }
 }
 
@@ -1578,12 +1540,13 @@ private fun ExitingCardOverlay(
             verticalTravel.toDouble(),
         ).toFloat().coerceAtLeast(240f)
         val initialVelocityProgress =
-            (-exitCard.startVelocityY / distanceEstimate).coerceIn(0.6f, 6.5f)
+            (-exitCard.startVelocityY / distanceEstimate).coerceIn(0.6f, 3.4f)
 
         val anim = TargetBasedAnimation(
             animationSpec = spring(
                 dampingRatio = maxOf(dismissDampingRatio, Spring.DampingRatioNoBouncy),
-                stiffness = maxOf(dismissStiffness, Spring.StiffnessMedium),
+                stiffness = ViewerTransitionStiffness,
+                visibilityThreshold = ViewerTransitionVisibilityThreshold,
             ),
             typeConverter = Float.VectorConverter,
             initialValue = 0f,
@@ -1665,12 +1628,13 @@ private fun UndoReturningCardOverlay(
         val anim = TargetBasedAnimation(
             animationSpec = spring(
                 dampingRatio = maxOf(settleDampingRatio, Spring.DampingRatioNoBouncy),
-                stiffness = settleStiffness,
+                stiffness = ViewerTransitionStiffness,
+                visibilityThreshold = ViewerTransitionVisibilityThreshold,
             ),
             typeConverter = Float.VectorConverter,
             initialValue = returningCard.startProgress,
             targetValue = 0f,
-            initialVelocity = -1.2f,
+            initialVelocity = -0.75f,
         )
         var startNanos = Long.MIN_VALUE
         try {

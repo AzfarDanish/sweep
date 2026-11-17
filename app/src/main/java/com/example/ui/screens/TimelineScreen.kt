@@ -48,6 +48,7 @@ import coil.request.videoFrameMillis
 import com.example.R
 import com.example.model.PermissionAccessState
 import com.example.model.TimelineMonthGroup
+import com.example.ui.components.HeaderTrashButton
 import com.example.ui.components.PermissionGateView
 import com.example.ui.components.rememberSweepImageLoader
 import com.example.ui.state.MediaLibraryUiState
@@ -61,6 +62,7 @@ fun TimelineScreen(
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    onOpenTrash: () -> Unit = {},
 ) {
     val imageLoader = rememberSweepImageLoader()
     val activeYearGroup = uiState.timelineYears.firstOrNull { it.year == uiState.selectedYear }
@@ -80,6 +82,14 @@ fun TimelineScreen(
                         Text(
                             text = stringResource(R.string.nav_timeline),
                             style = MaterialTheme.typography.headlineMedium,
+                        )
+                    },
+                    actions = {
+                        HeaderTrashButton(
+                            trashCount = uiState.trashedMedia.size,
+                            onClick = onOpenTrash,
+                            buttonTestTag = "timeline_trash_button",
+                            badgeTestTag = "timeline_trash_badge",
                         )
                     },
                 )
