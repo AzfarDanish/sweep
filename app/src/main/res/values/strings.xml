@@ -31,6 +31,11 @@
     <string name="empty_trash_action">Empty Trash</string>
     <string name="undo">Undo</string>
     <string name="redo">Redo</string>
+    <string name="next">Next</string>
+    <string name="trash_action">Trash</string>
+    <string name="move_to_album">Move to Album</string>
+    <string name="move_to_album_title">Move to Album</string>
+    <string name="move_to_album_empty">No other albums available</string>
     <string name="moved_to_trash">Moved to trash</string>
     <string name="restored_from_trash">Restored from trash</string>
     <string name="add_folder">Add Folder</string>

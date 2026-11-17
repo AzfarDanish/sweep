@@ -3,15 +3,13 @@ package com.example.ui.screens
 import android.content.Context
 import android.view.LayoutInflater
 import android.view.ViewGroup
-import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.Spring
 import androidx.compose.animation.core.TargetBasedAnimation
 import androidx.compose.animation.core.VectorConverter
 import androidx.compose.animation.core.spring
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculateCentroidSize
@@ -25,39 +23,36 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
-import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
-import androidx.compose.foundation.layout.only
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.Redo
+import androidx.compose.material.icons.automirrored.outlined.ArrowForward
 import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.automirrored.outlined.VolumeOff
 import androidx.compose.material.icons.automirrored.outlined.VolumeUp
 import androidx.compose.material.icons.outlined.DeleteForever
 import androidx.compose.material.icons.outlined.DeleteOutline
-import androidx.compose.material.icons.outlined.Info
-import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.Pause
+import androidx.compose.material.icons.outlined.PhotoAlbum
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.RestoreFromTrash
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
-import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -66,6 +61,7 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.SliderDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
@@ -93,9 +89,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.isSpecified
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
@@ -125,6 +121,8 @@ import coil.request.videoFrameMillis
 import coil.size.Precision
 import com.example.R
 import com.example.data.UndoRedoUiState
+import com.example.model.AlbumCollection
+import com.example.model.AlbumKind
 import com.example.model.MediaItem
 import com.example.ui.components.MediaInfoSheet
 import com.example.ui.components.PermanentDeleteDialog
@@ -232,6 +230,8 @@ fun MediaViewerScreen(
     onPermanentDeleteItem: (MediaItem) -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
+    albums: List<AlbumCollection> = emptyList(),
+    onMoveToAlbum: (MediaItem, AlbumCollection) -> Unit = { _, _ -> },
 ) {
     val startIndex = remember(initialMediaId) {
         items.indexOfFirst { it.id == initialMediaId }.coerceAtLeast(0)
@@ -248,10 +248,12 @@ fun MediaViewerScreen(
     // has already left the list.
     val resolvedRatios = remember { mutableStateMapOf<Long, Float>() }
 
-    var showControls by remember { mutableStateOf(true) }
+    // The fixed headers never hide. Only the video transport fades in/out, inside the viewport.
+    var showVideoTransport by remember { mutableStateOf(true) }
     var showInfoSheet by remember { mutableStateOf(false) }
     var isCurrentZoomed by remember { mutableStateOf(false) }
     var pendingDeleteItem by remember { mutableStateOf<MediaItem?>(null) }
+    var albumPickerItem by remember { mutableStateOf<MediaItem?>(null) }
     var activeExoPlayer by remember { mutableStateOf<ExoPlayer?>(null) }
 
     val effectivePage = if (items.isEmpty()) {
@@ -295,6 +297,7 @@ fun MediaViewerScreen(
     }
 
     LaunchedEffect(currentItem?.id, currentItem?.isVideo) {
+        showVideoTransport = true
         if (currentItem?.isVideo != true) {
             activeExoPlayer = null
         }
@@ -331,6 +334,18 @@ fun MediaViewerScreen(
         MediaInfoSheet(
             item = currentItem,
             onDismiss = { showInfoSheet = false },
+        )
+    }
+
+    albumPickerItem?.let { pickerItem ->
+        MoveToAlbumDialog(
+            item = pickerItem,
+            albums = albums,
+            onDismiss = { albumPickerItem = null },
+            onSelect = { album ->
+                albumPickerItem = null
+                onMoveToAlbum(pickerItem, album)
+            },
         )
     }
 
@@ -417,6 +432,7 @@ fun MediaViewerScreen(
                 dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
             )
             exitingCards.add(exitCard)
+            androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
             while (exitingCards.size > MaxExitingCards) {
                 exitingCards.removeAt(0)
             }
@@ -458,6 +474,7 @@ fun MediaViewerScreen(
             // and thumbnails update from the repository's optimistic state; the viewer never waits
             // for the exit spring or for image decoding.
             latestOnTrashItem(targetItem)
+            androidx.compose.runtime.snapshots.Snapshot.sendApplyNotifications()
         }
     }
 
@@ -468,18 +485,29 @@ fun MediaViewerScreen(
         }
     }
 
-    Box(
+    Column(
         modifier = Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .windowInsetsPadding(WindowInsets.safeDrawing)
             .testTag("media_viewer_screen"),
     ) {
-        // The media viewport owns the entire window. Controls float above it, so no header or
-        // bottom section reserves height away from the media.
+        ViewerTopHeader(
+            currentItem = currentItem,
+            currentIndex = effectivePage,
+            totalCount = items.size,
+            trashCount = trashCount,
+            onBack = onBack,
+            onOpenTrash = onOpenTrash,
+        )
+
+        // The media viewport is the only flexible region. Every gesture and every animated media
+        // layer lives here, so the fixed headers can never move, resize, or be covered.
         Box(
             contentAlignment = Alignment.Center,
             modifier = Modifier
-                .fillMaxSize()
+                .fillMaxWidth()
+                .weight(1f)
                 .clipToBounds()
                 .onSizeChanged { size ->
                     if (size.height > 0) viewportHeightPx = size.height.toFloat()
@@ -506,20 +534,6 @@ fun MediaViewerScreen(
                             colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
                         ) {
                             Text("Done")
-                        }
-                        if (!isTrashPreview && undoRedoState.canUndo) {
-                            Button(
-                                onClick = {
-                                    committedTrashIds.clear()
-                                    onUndo()
-                                },
-                                colors = ButtonDefaults.buttonColors(
-                                    containerColor = Color.White,
-                                    contentColor = Color.Black,
-                                ),
-                            ) {
-                                Text(stringResource(R.string.undo))
-                            }
                         }
                     }
                 }
@@ -616,7 +630,9 @@ fun MediaViewerScreen(
                                         activeExoPlayer = null
                                     }
                                 },
-                                onToggleControls = { showControls = !showControls },
+                                onToggleTransport = {
+                                    showVideoTransport = !showVideoTransport
+                                },
                                 onLongPress = { showInfoSheet = true },
                             )
                         } else {
@@ -630,7 +646,7 @@ fun MediaViewerScreen(
                                         isCurrentZoomed = zoomed
                                     }
                                 },
-                                onTap = { showControls = !showControls },
+                                onTap = {},
                                 onLongPress = { showInfoSheet = true },
                             )
                         }
@@ -649,6 +665,28 @@ fun MediaViewerScreen(
                 }
             }
 
+            // Video transport is contained by the viewport and never reserves space from it.
+            if (currentItem?.isVideo == true &&
+                showVideoTransport &&
+                trashSwipeController.phase != VerticalSwipePhase.Dragging &&
+                trashSwipeController.phase != VerticalSwipePhase.Dismissed
+            ) {
+                Column(
+                    modifier = Modifier
+                        .align(Alignment.BottomCenter)
+                        .fillMaxWidth()
+                        .zIndex(2f)
+                        .background(Color.Black.copy(alpha = 0.55f))
+                        .padding(horizontal = 16.dp, vertical = 6.dp)
+                        .testTag("viewer_video_transport"),
+                ) {
+                    VideoControlsBar(
+                        exoPlayer = activeExoPlayer,
+                        fallbackDurationMs = currentItem.durationMillis,
+                    )
+                }
+            }
+
             // Independent outgoing flight overlays so the incoming card is immediately
             // interactive. These live outside the item branch so the final card still flies
             // out after the list becomes empty, instead of vanishing mid-transition.
@@ -661,44 +699,25 @@ fun MediaViewerScreen(
             )
         }
 
-        ViewerTopHeader(
+        ViewerBottomHeader(
             currentItem = currentItem,
-            currentIndex = effectivePage,
-            totalCount = items.size,
-            trashCount = trashCount,
             isTrashPreview = isTrashPreview,
             undoRedoState = undoRedoState,
-            controlsVisible = showControls || currentItem == null,
-            onBack = onBack,
-            onShowInfo = { showInfoSheet = true },
-            onOpenTrash = onOpenTrash,
-            onMoveToTrash = { currentItem?.let(triggerExitTrash) },
-            onRestore = { currentItem?.let(onRestoreItem) },
-            onPermanentDelete = { currentItem?.let { pendingDeleteItem = it } },
+            canMoveToAlbum = albums.any { it.kind == AlbumKind.FOLDER },
+            onNext = {
+                val targetPage = (effectivePage + 1).coerceAtMost(items.lastIndex)
+                if (targetPage > effectivePage) {
+                    scope.launch { pagerState.animateScrollToPage(targetPage) }
+                }
+            },
             onUndo = {
                 committedTrashIds.clear()
                 onUndo()
             },
-            onRedo = onRedo,
-            modifier = Modifier.align(Alignment.TopCenter),
-        )
-
-        ViewerBottomBar(
-            currentItem = currentItem,
-            isTrashPreview = isTrashPreview,
-            activeExoPlayer = activeExoPlayer,
-            showControls = showControls,
-            trashSwipeController = trashSwipeController,
-            trashSwipeConfig = trashConfig,
-            scope = scope,
-            canSwipeUpToTrash = !isTrashPreview &&
-                !isCurrentZoomed &&
-                !pagerState.isScrollInProgress &&
-                currentItem != null,
-            onSwipeUpCommit = commitTrashTransition,
+            onMoveToAlbum = { currentItem?.let { albumPickerItem = it } },
+            onTrash = { currentItem?.let(triggerExitTrash) },
             onRestore = { currentItem?.let(onRestoreItem) },
             onPermanentDelete = { currentItem?.let { pendingDeleteItem = it } },
-            modifier = Modifier.align(Alignment.BottomCenter),
         )
     }
 }
@@ -709,363 +728,283 @@ private fun ViewerTopHeader(
     currentIndex: Int,
     totalCount: Int,
     trashCount: Int,
-    isTrashPreview: Boolean,
-    undoRedoState: UndoRedoUiState,
-    controlsVisible: Boolean,
     onBack: () -> Unit,
-    onShowInfo: () -> Unit,
     onOpenTrash: () -> Unit,
-    onMoveToTrash: () -> Unit,
-    onRestore: () -> Unit,
-    onPermanentDelete: () -> Unit,
-    onUndo: () -> Unit,
-    onRedo: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    var showMoreMenu by remember { mutableStateOf(false) }
-
-    // The header floats above the media. Only the controls themselves occupy space; when they
-    // fade out nothing is reserved over the preview.
-    AnimatedVisibility(
-        visible = controlsVisible,
-        enter = fadeIn(),
-        exit = fadeOut(),
+    // The header owns dedicated layout space above the viewport. The centered block is aligned to
+    // the header's own center (not to the space left between the buttons), so the date and the
+    // position remain visually centered on screen regardless of badge width.
+    Box(
         modifier = modifier
             .fillMaxWidth()
-            .zIndex(1f),
+            .heightIn(min = 56.dp)
+            .background(Color.Black)
+            .testTag("viewer_top_header"),
     ) {
-        Box(
+        IconButton(
+            onClick = onBack,
             modifier = Modifier
-                .fillMaxWidth()
-                .background(
-                    Brush.verticalGradient(
-                        colors = listOf(
-                            Color.Black.copy(alpha = 0.62f),
-                            Color.Transparent,
-                        ),
-                    ),
-                )
-                .windowInsetsPadding(
-                    WindowInsets.safeDrawing.only(
-                        WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
-                    ),
-                )
-                .heightIn(min = 56.dp),
+                .align(Alignment.CenterStart)
+                .minimumInteractiveComponentSize()
+                .testTag("viewer_back_button"),
         ) {
-            Row(
-                verticalAlignment = Alignment.CenterVertically,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = 56.dp)
-                    .padding(horizontal = 8.dp, vertical = 4.dp),
-            ) {
-                IconButton(
-                    onClick = onBack,
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .testTag("viewer_back_button"),
+            Icon(
+                imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                contentDescription = "Back",
+                tint = Color.White,
+            )
+        }
+
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+            modifier = Modifier
+                .align(Alignment.Center)
+                .padding(horizontal = 72.dp),
+        ) {
+            if (currentItem != null) {
+                Text(
+                    text = Formatters.formatFullDateTime(currentItem.effectiveTimestampMillis),
+                    style = MaterialTheme.typography.titleSmall,
+                    color = Color.White,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Text(
+                    text = "${currentIndex + 1} / $totalCount",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = Color.White.copy(alpha = 0.75f),
+                    maxLines = 1,
+                )
+            }
+        }
+
+        IconButton(
+            onClick = onOpenTrash,
+            modifier = Modifier
+                .align(Alignment.CenterEnd)
+                .minimumInteractiveComponentSize()
+                .testTag("viewer_trash_button"),
+        ) {
+            if (trashCount > 0) {
+                BadgedBox(
+                    badge = {
+                        Badge(
+                            containerColor = Color.White,
+                            contentColor = Color.Black,
+                            modifier = Modifier.testTag("viewer_trash_badge"),
+                        ) {
+                            Text(
+                                text = if (trashCount > 99) "99+" else trashCount.toString(),
+                                style = MaterialTheme.typography.labelSmall,
+                            )
+                        }
+                    },
                 ) {
                     Icon(
-                        imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
-                        contentDescription = "Back",
+                        imageVector = Icons.Outlined.DeleteOutline,
+                        contentDescription = stringResource(R.string.trash_bin_count_cd, trashCount),
                         tint = Color.White,
                     )
                 }
-
-                Column(modifier = Modifier.weight(1f)) {
-                    if (currentItem != null) {
-                        Text(
-                            text = Formatters.formatFullDateTime(currentItem.effectiveTimestampMillis),
-                            style = MaterialTheme.typography.titleSmall,
-                            color = Color.White,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                        Text(
-                            text = "${currentIndex + 1} / $totalCount",
-                            style = MaterialTheme.typography.bodySmall,
-                            color = Color.White.copy(alpha = 0.75f),
-                            maxLines = 1,
-                        )
-                    }
-                }
-
-                if (currentItem != null) {
-                    IconButton(
-                        onClick = onShowInfo,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("viewer_info_button"),
-                    ) {
-                        Icon(
-                            imageVector = Icons.Outlined.Info,
-                            contentDescription = "Media information",
-                            tint = Color.White,
-                        )
-                    }
-                }
-
-                IconButton(
-                    onClick = onOpenTrash,
-                    modifier = Modifier
-                        .minimumInteractiveComponentSize()
-                        .testTag("viewer_trash_button"),
-                ) {
-                    if (trashCount > 0) {
-                        BadgedBox(
-                            badge = {
-                                Badge(
-                                    containerColor = Color.White,
-                                    contentColor = Color.Black,
-                                    modifier = Modifier.testTag("viewer_trash_badge"),
-                                ) {
-                                    Text(
-                                        text = if (trashCount > 99) "99+" else trashCount.toString(),
-                                        style = MaterialTheme.typography.labelSmall,
-                                    )
-                                }
-                            },
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.DeleteOutline,
-                                contentDescription = stringResource(R.string.trash_bin_count_cd, trashCount),
-                                tint = Color.White,
-                            )
-                        }
-                    } else {
-                        Icon(
-                            imageVector = Icons.Outlined.DeleteOutline,
-                            contentDescription = stringResource(R.string.trash_bin_empty_cd),
-                            tint = Color.White.copy(alpha = 0.72f),
-                        )
-                    }
-                }
-
-                if (currentItem != null) {
-                    Box {
-                        IconButton(
-                            onClick = { showMoreMenu = true },
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("viewer_more_button"),
-                        ) {
-                            Icon(
-                                imageVector = Icons.Outlined.MoreVert,
-                                contentDescription = "More actions",
-                                tint = Color.White,
-                            )
-                        }
-                        DropdownMenu(
-                            expanded = showMoreMenu,
-                            onDismissRequest = { showMoreMenu = false },
-                        ) {
-                            if (isTrashPreview) {
-                                DropdownMenuItem(
-                                    text = { Text(stringResource(R.string.restore)) },
-                                    leadingIcon = {
-                                        Icon(Icons.Outlined.RestoreFromTrash, contentDescription = null)
-                                    },
-                                    onClick = {
-                                        showMoreMenu = false
-                                        onRestore()
-                                    },
-                                )
-                                DropdownMenuItem(
-                                    text = { Text(stringResource(R.string.delete_permanently_action)) },
-                                    leadingIcon = {
-                                        Icon(Icons.Outlined.DeleteForever, contentDescription = null)
-                                    },
-                                    onClick = {
-                                        showMoreMenu = false
-                                        onPermanentDelete()
-                                    },
-                                )
-                            } else {
-                                DropdownMenuItem(
-                                    text = { Text("Move to trash") },
-                                    leadingIcon = {
-                                        Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
-                                    },
-                                    onClick = {
-                                        showMoreMenu = false
-                                        onMoveToTrash()
-                                    },
-                                )
-                                if (undoRedoState.canUndo) {
-                                    DropdownMenuItem(
-                                        text = { Text(stringResource(R.string.undo)) },
-                                        leadingIcon = {
-                                            Icon(Icons.AutoMirrored.Outlined.Undo, contentDescription = null)
-                                        },
-                                        onClick = {
-                                            showMoreMenu = false
-                                            onUndo()
-                                        },
-                                    )
-                                }
-                                if (undoRedoState.canRedo) {
-                                    DropdownMenuItem(
-                                        text = { Text(stringResource(R.string.redo)) },
-                                        leadingIcon = {
-                                            Icon(Icons.AutoMirrored.Outlined.Redo, contentDescription = null)
-                                        },
-                                        onClick = {
-                                            showMoreMenu = false
-                                            onRedo()
-                                        },
-                                    )
-                                }
-                            }
-                        }
-                    }
-                }
+            } else {
+                Icon(
+                    imageVector = Icons.Outlined.DeleteOutline,
+                    contentDescription = stringResource(R.string.trash_bin_empty_cd),
+                    tint = Color.White.copy(alpha = 0.72f),
+                )
             }
         }
     }
 }
 
 @Composable
-private fun ViewerBottomBar(
+private fun ViewerBottomHeader(
     currentItem: MediaItem?,
     isTrashPreview: Boolean,
-    activeExoPlayer: ExoPlayer?,
-    showControls: Boolean,
-    trashSwipeController: PhysicsVerticalSwipeController,
-    trashSwipeConfig: PhysicsVerticalSwipeConfig,
-    scope: CoroutineScope,
-    canSwipeUpToTrash: Boolean,
-    onSwipeUpCommit: (Float, Float) -> Unit,
+    undoRedoState: UndoRedoUiState,
+    canMoveToAlbum: Boolean,
+    onNext: () -> Unit,
+    onUndo: () -> Unit,
+    onMoveToAlbum: () -> Unit,
+    onTrash: () -> Unit,
     onRestore: () -> Unit,
     onPermanentDelete: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val controlsVisible = showControls &&
-        trashSwipeController.phase != VerticalSwipePhase.Dragging &&
-        trashSwipeController.phase != VerticalSwipePhase.Dismissed
-    // Transparent overlay: the bars never subtract height from the media viewport.
     Surface(
-        color = Color.Transparent,
+        color = Color.Black,
         modifier = modifier
             .fillMaxWidth()
-            .zIndex(1f)
-            .physicsVerticalSwipe(
-                controller = trashSwipeController,
-                config = trashSwipeConfig,
-                scope = scope,
-                enabled = currentItem != null && !isTrashPreview,
-                key = isTrashPreview,
-                restPhase = VerticalSwipePhase.Idle,
-                canEngage = { canSwipeUpToTrash },
-                onDismissed = {},
-                onDismissCommit = onSwipeUpCommit,
-            )
             .testTag("viewer_bottom_bar"),
     ) {
-        Box(
+        Row(
+            verticalAlignment = Alignment.CenterVertically,
             modifier = Modifier
                 .fillMaxWidth()
-                .windowInsetsPadding(
-                    WindowInsets.safeDrawing.only(
-                        WindowInsetsSides.Bottom + WindowInsetsSides.Horizontal,
-                    ),
-                ),
+                .heightIn(min = 64.dp)
+                .padding(horizontal = 8.dp),
         ) {
-            if (currentItem == null) {
-                return@Box
+            if (isTrashPreview) {
+                ViewerActionButton(
+                    icon = Icons.Outlined.RestoreFromTrash,
+                    contentDescription = stringResource(R.string.restore),
+                    enabled = currentItem != null,
+                    onClick = onRestore,
+                    testTag = "viewer_restore_button",
+                    modifier = Modifier.weight(1f),
+                )
+                ViewerActionButton(
+                    icon = Icons.Outlined.DeleteForever,
+                    contentDescription = stringResource(R.string.delete_permanently_action),
+                    enabled = currentItem != null,
+                    onClick = onPermanentDelete,
+                    tint = MaterialTheme.colorScheme.error,
+                    testTag = "viewer_permanent_delete_button",
+                    modifier = Modifier.weight(1f),
+                )
+            } else {
+                ViewerActionButton(
+                    icon = Icons.AutoMirrored.Outlined.ArrowForward,
+                    contentDescription = stringResource(R.string.next),
+                    enabled = currentItem != null,
+                    onClick = onNext,
+                    testTag = "viewer_next_button",
+                    modifier = Modifier.weight(1f),
+                )
+                ViewerActionButton(
+                    icon = Icons.AutoMirrored.Outlined.Undo,
+                    contentDescription = stringResource(R.string.undo),
+                    enabled = undoRedoState.canUndo,
+                    onClick = onUndo,
+                    testTag = "viewer_undo_button",
+                    modifier = Modifier.weight(1f),
+                )
+                ViewerActionButton(
+                    icon = Icons.Outlined.PhotoAlbum,
+                    contentDescription = stringResource(R.string.move_to_album),
+                    enabled = currentItem != null && canMoveToAlbum,
+                    onClick = onMoveToAlbum,
+                    testTag = "viewer_move_to_album_button",
+                    modifier = Modifier.weight(1f),
+                )
+                ViewerActionButton(
+                    icon = Icons.Outlined.DeleteOutline,
+                    contentDescription = stringResource(R.string.trash_action),
+                    enabled = currentItem != null,
+                    onClick = onTrash,
+                    testTag = "viewer_trash_action_button",
+                    modifier = Modifier.weight(1f),
+                )
             }
+        }
+    }
+}
 
-            val minControlsHeight = when {
-                isTrashPreview && currentItem.isVideo -> 164.dp
-                currentItem.isVideo -> 104.dp
-                isTrashPreview -> 68.dp
-                // Only the drag handle remains for photos; it overlays the media bottom edge.
-                else -> 12.dp
+@Composable
+private fun ViewerActionButton(
+    icon: ImageVector,
+    contentDescription: String,
+    enabled: Boolean,
+    onClick: () -> Unit,
+    testTag: String,
+    modifier: Modifier = Modifier,
+    tint: Color = Color.White,
+) {
+    IconButton(
+        onClick = onClick,
+        enabled = enabled,
+        modifier = modifier
+            .minimumInteractiveComponentSize()
+            .testTag(testTag),
+    ) {
+        Icon(
+            imageVector = icon,
+            contentDescription = contentDescription,
+            tint = if (enabled) tint else tint.copy(alpha = 0.32f),
+        )
+    }
+}
+
+@Composable
+private fun MoveToAlbumDialog(
+    item: MediaItem,
+    albums: List<AlbumCollection>,
+    onDismiss: () -> Unit,
+    onSelect: (AlbumCollection) -> Unit,
+) {
+    val currentFolder = remember(item.relativePath) { normalizeAlbumPath(item.relativePath) }
+    val destinations = remember(albums, currentFolder) {
+        albums.asSequence()
+            .filter { it.kind == AlbumKind.FOLDER }
+            .filter { album ->
+                val folder = album.items.firstOrNull()?.relativePath ?: return@filter false
+                normalizeAlbumPath(folder) != currentFolder
             }
+            .distinctBy { normalizeAlbumPath(it.items.firstOrNull()?.relativePath.orEmpty()) }
+            .sortedBy { it.name.lowercase() }
+            .toList()
+    }
 
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .heightIn(min = minControlsHeight),
-            ) {
-                AnimatedVisibility(
-                    visible = controlsVisible,
-                    enter = fadeIn(),
-                    exit = fadeOut(),
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.move_to_album_title)) },
+        text = {
+            if (destinations.isEmpty()) {
+                Text(stringResource(R.string.move_to_album_empty))
+            } else {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 360.dp),
                 ) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .background(
-                                Brush.verticalGradient(
-                                    colors = listOf(
-                                        Color.Transparent,
-                                        Color.Black.copy(alpha = 0.62f),
-                                    ),
-                                ),
-                            ),
-                    ) {
-                        if (!isTrashPreview) {
-                            Box(
-                                modifier = Modifier
-                                    .padding(top = 6.dp, bottom = 2.dp)
-                                    .width(32.dp)
-                                    .height(3.dp)
-                                    .clip(RoundedCornerShape(2.dp))
-                                    .background(Color.White.copy(alpha = 0.28f))
-                                    .testTag("viewer_bottom_drag_handle"),
+                    items(destinations, key = { it.id }) { album ->
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clip(RoundedCornerShape(10.dp))
+                                .clickable { onSelect(album) }
+                                .padding(horizontal = 4.dp, vertical = 12.dp)
+                                .testTag("move_to_album_option_${album.id}"),
+                        ) {
+                            Icon(
+                                imageVector = Icons.Outlined.PhotoAlbum,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp),
                             )
-                        }
-                        if (currentItem.isVideo) {
-                            VideoControlsBar(
-                                exoPlayer = activeExoPlayer,
-                                fallbackDurationMs = currentItem.durationMillis,
-                            )
-                        }
-                        if (isTrashPreview) {
-                            Row(
-                                horizontalArrangement = Arrangement.SpaceEvenly,
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .padding(horizontal = 16.dp, vertical = 10.dp),
-                            ) {
-                                OutlinedButton(
-                                    onClick = onRestore,
-                                    colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                                    modifier = Modifier.testTag("viewer_restore_button"),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Outlined.RestoreFromTrash,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(stringResource(R.string.restore))
-                                }
-                                OutlinedButton(
-                                    onClick = onPermanentDelete,
-                                    colors = ButtonDefaults.outlinedButtonColors(
-                                        contentColor = MaterialTheme.colorScheme.error,
-                                    ),
-                                    modifier = Modifier.testTag("viewer_permanent_delete_button"),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.Outlined.DeleteForever,
-                                        contentDescription = null,
-                                        modifier = Modifier.size(18.dp),
-                                    )
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text(stringResource(R.string.delete_permanently_action))
-                                }
+                            Spacer(modifier = Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = album.name,
+                                    style = MaterialTheme.typography.titleSmall,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                Text(
+                                    text = "${album.count} items",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                )
                             }
                         }
                     }
                 }
             }
-        }
-    }
+        },
+        confirmButton = {},
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.cancel))
+            }
+        },
+    )
 }
+
+private fun normalizeAlbumPath(path: String): String = path.trim().trim('/')
 
 @Composable
 private fun VideoControlsBar(
@@ -1652,7 +1591,7 @@ private fun VideoPlayerPage(
     isCurrentPage: Boolean,
     onPlayerActive: (ExoPlayer) -> Unit,
     onPlayerInactive: (ExoPlayer) -> Unit,
-    onToggleControls: () -> Unit,
+    onToggleTransport: () -> Unit,
     onLongPress: () -> Unit,
 ) {
     val context = LocalContext.current
@@ -1664,7 +1603,7 @@ private fun VideoPlayerPage(
             .clipToBounds()
             .viewerTapGestures(
                 key = item.id,
-                onTap = onToggleControls,
+                onTap = onToggleTransport,
                 onLongPress = onLongPress,
             ),
     ) {

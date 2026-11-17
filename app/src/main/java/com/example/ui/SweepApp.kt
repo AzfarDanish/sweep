@@ -573,6 +573,8 @@ fun SweepApp(
                         },
                         onUndo = mediaViewModel::triggerUndo,
                         onRedo = mediaViewModel::triggerRedo,
+                        albums = mediaUiState.albums,
+                        onMoveToAlbum = mediaViewModel::requestMoveToAlbum,
                     )
                 }
             }

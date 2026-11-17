@@ -34,6 +34,8 @@ import androidx.compose.ui.unit.dp
 import androidx.test.core.app.ApplicationProvider
 import coil.size.Precision
 import com.example.data.UndoRedoUiState
+import com.example.model.AlbumCollection
+import com.example.model.AlbumKind
 import com.example.model.MediaItem
 import com.example.ui.components.GestureAxisLock
 import com.example.ui.components.MediaInfoSheet
@@ -128,7 +130,7 @@ class PhysicsVerticalSwipeTest {
     }
 
     @Test
-    fun `1b_slow_upward_drag_from_bottom_bar_handle_triggers_trash_once`() {
+    fun `1b_upward_drag_from_bottom_header_never_trashes_and_headers_stay_fixed`() {
         val trashed = mutableListOf<MediaItem>()
         composeTestRule.setContent {
             SweepTheme {
@@ -154,6 +156,11 @@ class PhysicsVerticalSwipeTest {
         }
 
         composeTestRule.waitForIdle()
+        val topHeaderBefore =
+            composeTestRule.onNodeWithTag("viewer_top_header").getUnclippedBoundsInRoot()
+        val bottomHeaderBefore =
+            composeTestRule.onNodeWithTag("viewer_bottom_bar").getUnclippedBoundsInRoot()
+
         composeTestRule.onNodeWithTag("viewer_bottom_bar").performTouchInput {
             down(center)
             moveBy(Offset(0f, -520f), delayMillis = 350L)
@@ -161,8 +168,118 @@ class PhysicsVerticalSwipeTest {
         }
         composeTestRule.waitForIdle()
 
-        assertEquals(1, trashed.size)
-        assertEquals(1L, trashed.first().id)
+        assertTrue(trashed.isEmpty())
+        composeTestRule.onNodeWithText("1 / 3").assertIsDisplayed()
+        val topHeaderAfter =
+            composeTestRule.onNodeWithTag("viewer_top_header").getUnclippedBoundsInRoot()
+        val bottomHeaderAfter =
+            composeTestRule.onNodeWithTag("viewer_bottom_bar").getUnclippedBoundsInRoot()
+        assertEquals(topHeaderBefore.top.value, topHeaderAfter.top.value, 0.5f)
+        assertEquals(topHeaderBefore.bottom.value, topHeaderAfter.bottom.value, 0.5f)
+        assertEquals(bottomHeaderBefore.top.value, bottomHeaderAfter.top.value, 0.5f)
+        assertEquals(bottomHeaderBefore.bottom.value, bottomHeaderAfter.bottom.value, 0.5f)
+    }
+
+    @Test
+    fun `1c_bottom_header_exposes_next_undo_album_and_trash_actions`() {
+        val trashed = mutableListOf<MediaItem>()
+        composeTestRule.setContent {
+            SweepTheme {
+                var items by remember { mutableStateOf(sampleItems(3)) }
+                MediaViewerScreen(
+                    items = items,
+                    initialMediaId = 1L,
+                    isTrashPreview = false,
+                    trashCount = trashed.size,
+                    undoRedoState = UndoRedoUiState(),
+                    onBack = {},
+                    onOpenTrash = {},
+                    onTrashItem = { item ->
+                        trashed.add(item)
+                        items = items.filterNot { it.id == item.id }
+                    },
+                    onRestoreItem = {},
+                    onPermanentDeleteItem = {},
+                    onUndo = {},
+                    onRedo = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("viewer_next_button").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("viewer_undo_button").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("viewer_move_to_album_button").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("viewer_trash_action_button").assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("viewer_next_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("2 / 3").assertIsDisplayed()
+
+        composeTestRule.onNodeWithTag("viewer_trash_action_button").performClick()
+        composeTestRule.waitForIdle()
+        assertEquals(listOf(2L), trashed.map { it.id })
+        composeTestRule.onNodeWithTag("viewer_next_button").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("viewer_undo_button").assertIsDisplayed()
+    }
+
+    @Test
+    fun `1d_move_to_album_picker_lists_other_folders_and_invokes_callback`() {
+        val current = sampleItems(1).first()
+        val cameraAlbum = AlbumCollection(
+            id = "folder_camera",
+            name = "Camera",
+            kind = AlbumKind.FOLDER,
+            coverUri = current.contentUri,
+            coverIsVideo = false,
+            count = 1,
+            subtitle = "DCIM/Camera",
+            items = listOf(current.copy(id = 87L, relativePath = "DCIM/Camera/")),
+        )
+        val tripsAlbum = AlbumCollection(
+            id = "folder_trips",
+            name = "Trips",
+            kind = AlbumKind.FOLDER,
+            coverUri = current.contentUri,
+            coverIsVideo = false,
+            count = 1,
+            subtitle = "DCIM/Trips",
+            items = listOf(current.copy(id = 88L, relativePath = "DCIM/Trips/")),
+        )
+        var selection: Pair<MediaItem, AlbumCollection>? = null
+
+        composeTestRule.setContent {
+            SweepTheme {
+                MediaViewerScreen(
+                    items = sampleItems(1),
+                    initialMediaId = 1L,
+                    isTrashPreview = false,
+                    trashCount = 0,
+                    undoRedoState = UndoRedoUiState(),
+                    onBack = {},
+                    onOpenTrash = {},
+                    onTrashItem = {},
+                    onRestoreItem = {},
+                    onPermanentDeleteItem = {},
+                    onUndo = {},
+                    onRedo = {},
+                    albums = listOf(cameraAlbum, tripsAlbum),
+                    onMoveToAlbum = { item, album -> selection = item to album },
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("viewer_move_to_album_button").performClick()
+        composeTestRule.waitForIdle()
+
+        composeTestRule.onNodeWithText("Move to Album").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("move_to_album_option_folder_camera").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("move_to_album_option_folder_trips").performClick()
+        composeTestRule.waitForIdle()
+
+        assertEquals(current.id, selection?.first?.id)
+        assertEquals("folder_trips", selection?.second?.id)
     }
 
     @Test
@@ -1253,12 +1370,21 @@ class PhysicsVerticalSwipeTest {
         composeTestRule.waitForIdle()
 
         val screenBounds = composeTestRule.onNodeWithTag("media_viewer_screen").getUnclippedBoundsInRoot()
+        val topHeaderBounds = composeTestRule.onNodeWithTag("viewer_top_header").getUnclippedBoundsInRoot()
         val viewportBounds = composeTestRule.onNodeWithTag("viewer_media_viewport").getUnclippedBoundsInRoot()
-        // Header and bottom controls float above the media, so the viewport fills the whole screen.
+        val bottomHeaderBounds = composeTestRule.onNodeWithTag("viewer_bottom_bar").getUnclippedBoundsInRoot()
+
+        // Three fixed regions: the viewport only receives the space between both headers.
         assertEquals(screenBounds.left.value, viewportBounds.left.value, 0.5f)
-        assertEquals(screenBounds.top.value, viewportBounds.top.value, 0.5f)
         assertEquals(screenBounds.right.value, viewportBounds.right.value, 0.5f)
-        assertEquals(screenBounds.bottom.value, viewportBounds.bottom.value, 0.5f)
+        assertTrue(
+            "Viewport must start below the top header",
+            viewportBounds.top.value >= topHeaderBounds.bottom.value - 0.5f,
+        )
+        assertTrue(
+            "Viewport must end above the bottom header",
+            viewportBounds.bottom.value <= bottomHeaderBounds.top.value + 0.5f,
+        )
 
         val viewportWidth = (viewportBounds.right - viewportBounds.left).value
         val viewportHeight = (viewportBounds.bottom - viewportBounds.top).value

@@ -44,6 +44,7 @@ enum class PendingOperationType {
     PERMANENT_DELETE,
     UNDO,
     REDO,
+    MOVE_TO_ALBUM,
 }
 
 data class PendingIntentOperation(
@@ -51,6 +52,8 @@ data class PendingIntentOperation(
     val type: PendingOperationType,
     val uris: List<Uri>,
     val viewerRemoval: Boolean = false,
+    val albumRelativePath: String? = null,
+    val albumName: String? = null,
 )
 
 data class SnackbarNotification(
@@ -421,6 +424,56 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    /**
+     * Moves one viewer item into an existing folder album. On API 30+ the system write consent is
+     * requested first; older platforms attempt the update directly and fail gracefully.
+     * Album moves intentionally stay out of the trash undo/redo stack.
+     */
+    fun requestMoveToAlbum(item: MediaItem, album: AlbumCollection) {
+        val target = album.items.firstOrNull()?.relativePath?.trim()?.trim('/') ?: return
+        if (target.isEmpty() || target == item.relativePath.trim().trim('/')) return
+
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val sender = repository.buildWriteIntentSender(listOf(item.contentUri))
+            if (sender != null) {
+                val op = PendingIntentOperation(
+                    intentSender = sender,
+                    type = PendingOperationType.MOVE_TO_ALBUM,
+                    uris = listOf(item.contentUri),
+                    albumRelativePath = target,
+                    albumName = album.name,
+                )
+                activePendingOp = op
+                _pendingOperation.tryEmit(op)
+                return
+            }
+        }
+
+        performMoveToAlbum(listOf(item.contentUri), target, album.name)
+    }
+
+    private fun performMoveToAlbum(uris: List<Uri>, targetRelativePath: String, albumName: String) {
+        viewModelScope.launch {
+            val movedUris = uris.filter { repository.moveToAlbum(it, targetRelativePath) }
+            if (movedUris.isNotEmpty()) {
+                viewerSessionDirty = true
+                _viewerItems.update { list ->
+                    list.map { item ->
+                        if (item.contentUri in movedUris) {
+                            item.copy(relativePath = targetRelativePath)
+                        } else {
+                            item
+                        }
+                    }
+                }
+                scheduleLibraryReconcile()
+                _snackbarEvents.tryEmit(SnackbarNotification("Moved to $albumName"))
+            } else {
+                _snackbarEvents.tryEmit(SnackbarNotification("Couldn't move to $albumName"))
+            }
+        }
+    }
+
     fun requestRestore(uris: List<Uri>, fromViewer: Boolean = false) {
         if (uris.isEmpty()) return
         viewModelScope.launch {
@@ -733,6 +786,11 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
                         isUndoAction = true,
                     ),
                 )
+            }
+
+            PendingOperationType.MOVE_TO_ALBUM -> {
+                val target = op.albumRelativePath ?: return
+                performMoveToAlbum(op.uris, target, op.albumName ?: "album")
             }
         }
     }

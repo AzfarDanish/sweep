@@ -220,6 +220,41 @@ class MediaStoreRepository(context: Context) {
         }
     }
 
+    /**
+     * Moves a single media item into [targetRelativePath], a MediaStore RELATIVE_PATH such as
+     * "Pictures/Trips/". Returns true only when the row was actually updated.
+     */
+    suspend fun moveToAlbum(uri: Uri, targetRelativePath: String): Boolean =
+        withContext(Dispatchers.IO) {
+            val relativePath = targetRelativePath.trim().let { path ->
+                when {
+                    path.isEmpty() -> return@withContext false
+                    path.endsWith("/") -> path
+                    else -> "$path/"
+                }
+            }
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+            }
+            runCatching { contentResolver.update(uri, values, null, null) > 0 }
+                .getOrDefault(false)
+        }
+
+    /**
+     * Requests one-shot system write consent for [uris] (API 30+). This is required before a
+     * RELATIVE_PATH update can touch media owned by another app.
+     */
+    fun buildWriteIntentSender(uris: List<Uri>): IntentSender? {
+        if (uris.isEmpty()) return null
+        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            runCatching {
+                MediaStore.createWriteRequest(contentResolver, uris).intentSender
+            }.getOrNull()
+        } else {
+            null
+        }
+    }
+
     suspend fun deleteDirectlyLegacy(uris: List<Uri>): Boolean = withContext(Dispatchers.IO) {
         var allDeleted = true
         for (uri in uris) {
