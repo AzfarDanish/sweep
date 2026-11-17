@@ -151,10 +151,6 @@ fun SweepApp(
         }
     }
 
-    LaunchedEffect(mediaUiState.trashedMedia) {
-        filesViewModel.refreshCurrent()
-    }
-
     DisposableEffect(lifecycleOwner) {
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
@@ -217,6 +213,16 @@ fun SweepApp(
     val isTopLevel = currentDestination == null || destinations.any { dest ->
         currentDestination.hasRoute(dest.route::class)
     }
+    val isFilesVisible = currentDestination?.hasRoute(FilesRoute::class) == true
+
+    // File listings only need refreshing when they are actually on screen. Previously every
+    // swipe-to-trash triggered an unrelated SAF/media scan while the viewer was open.
+    LaunchedEffect(mediaUiState.trashedMedia, isFilesVisible) {
+        if (isFilesVisible) {
+            filesViewModel.refreshCurrent()
+        }
+    }
+
     val useNavigationRail = widthSizeClass != WindowWidthSizeClass.Compact
 
     val gridColumns = when (widthSizeClass) {
@@ -528,6 +534,13 @@ fun SweepApp(
 
                 composable<ViewerRoute> { entry ->
                     val route = entry.toRoute<ViewerRoute>()
+
+                    // Trash actions are applied to the viewer list immediately and reconciled in
+                    // the background; refresh the gallery once when the viewer leaves.
+                    DisposableEffect(Unit) {
+                        onDispose { mediaViewModel.refreshAfterViewerSession() }
+                    }
+
                     MediaViewerScreen(
                         items = viewerItems,
                         initialMediaId = route.initialMediaId,

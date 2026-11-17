@@ -1,7 +1,6 @@
 package com.example.ui.screens
 
 import android.content.Context
-import android.os.Build
 import android.view.LayoutInflater
 import android.view.ViewGroup
 import androidx.compose.animation.AnimatedVisibility
@@ -21,6 +20,7 @@ import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -77,21 +77,23 @@ import androidx.compose.runtime.key
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateListOf
+import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
+import androidx.compose.runtime.snapshots.SnapshotStateList
 import androidx.compose.runtime.withFrameNanos
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.composed
-import androidx.compose.ui.draw.BlurredEdgeTreatment
-import androidx.compose.ui.draw.blur
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.isSpecified
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.PointerEventPass
@@ -116,7 +118,6 @@ import androidx.media3.exoplayer.ExoPlayer
 import androidx.media3.ui.AspectRatioFrameLayout
 import androidx.media3.ui.PlayerView
 import coil.ImageLoader
-import coil.compose.AsyncImage
 import coil.compose.rememberAsyncImagePainter
 import coil.request.Disposable as CoilDisposable
 import coil.request.ImageRequest
@@ -131,6 +132,7 @@ import com.example.ui.components.PhysicsVerticalSwipeConfig
 import com.example.ui.components.PhysicsVerticalSwipeController
 import com.example.ui.components.VerticalSwipeDirection
 import com.example.ui.components.VerticalSwipePhase
+import com.example.ui.components.ViewerImageRequestParameter
 import com.example.ui.components.physicsVerticalSwipe
 import com.example.ui.components.rememberPhysicsVerticalSwipeConfig
 import com.example.ui.components.rememberSweepImageLoader
@@ -143,6 +145,77 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+
+private const val MaxExitingCards = 3
+private const val ViewerPrefetchMaxHandles = 6
+
+
+private class IncrementingCounter {
+    var value: Long = 0L
+}
+
+private class IncomingExpansionAnimator {
+    var job: Job? = null
+    var generation: Long = 0L
+}
+
+/**
+ * Keeps a small warm window of upcoming media decoded without cancelling an in-flight preload at
+ * the exact moment it becomes the active page. A bounded LRU releases anything no longer needed.
+ */
+private class ViewerPrefetchCache {
+    private val handles = LinkedHashMap<Long, CoilDisposable>()
+
+    fun sync(
+        context: Context,
+        imageLoader: ImageLoader,
+        items: List<MediaItem>,
+        page: Int,
+    ) {
+        if (items.isEmpty()) return
+
+        val window = ArrayList<MediaItem>(4)
+        for (offset in intArrayOf(0, 1, 2, -1)) {
+            val item = items.getOrNull(page + offset) ?: continue
+            if (window.none { it.id == item.id }) {
+                window.add(item)
+            }
+        }
+
+        val desiredIds = HashSet<Long>(window.size)
+        for (item in window) {
+            desiredIds.add(item.id)
+            val existing = handles.remove(item.id)
+            if (existing != null) {
+                // Reinsert to mark it as recently used.
+                handles[item.id] = existing
+            } else {
+                handles[item.id] = imageLoader.enqueue(buildViewerImageRequest(context, item))
+            }
+        }
+
+        // Keep a couple of recently used stale handles so a preload that is still decoding is not
+        // cancelled during a page change. Only the oldest stale handles beyond the cap are freed.
+        val iterator = handles.entries.iterator()
+        while (handles.size > ViewerPrefetchMaxHandles && iterator.hasNext()) {
+            val entry = iterator.next()
+            if (entry.key !in desiredIds) {
+                entry.value.dispose()
+                iterator.remove()
+            }
+        }
+        while (handles.size > ViewerPrefetchMaxHandles) {
+            val oldest = handles.entries.firstOrNull() ?: break
+            oldest.value.dispose()
+            handles.remove(oldest.key)
+        }
+    }
+
+    fun dispose() {
+        handles.values.forEach { it.dispose() }
+        handles.clear()
+    }
+}
 
 @Composable
 fun MediaViewerScreen(
@@ -169,8 +242,11 @@ fun MediaViewerScreen(
     )
 
     val context = LocalContext.current
-    val localDensity = LocalDensity.current
     val imageLoader = rememberSweepImageLoader()
+    // Decoded intrinsic ratios are authoritative because MediaStore width/height can be transposed
+    // for EXIF-rotated photos. The map also keeps an outgoing card correctly sized after its item
+    // has already left the list.
+    val resolvedRatios = remember { mutableStateMapOf<Long, Float>() }
 
     var showControls by remember { mutableStateOf(true) }
     var showInfoSheet by remember { mutableStateOf(false) }
@@ -191,22 +267,24 @@ fun MediaViewerScreen(
     }
 
     val committedTrashIds = remember { HashSet<Long>() }
-    var previousItemIds by remember { mutableStateOf<Set<Long>>(emptySet()) }
+    val knownItemIds = remember { HashSet<Long>() }
     val exitingCards = remember { mutableStateListOf<ExitingCardState>() }
-    var nextExitInstanceId by remember { mutableLongStateOf(0L) }
+    val exitIdCounter = remember { IncrementingCounter() }
 
     val incomingRevealProgress = remember { mutableFloatStateOf(1f) }
-    var incomingExpansionJob by remember { mutableStateOf<Job?>(null) }
-    var incomingGeneration by remember { mutableLongStateOf(0L) }
+    val incomingExpansion = remember { IncomingExpansionAnimator() }
 
     LaunchedEffect(items) {
         val currentIds = items.mapTo(HashSet(items.size)) { it.id }
+        // Only clear the duplicate-commit guard when an item reappears (e.g. after undo).
+        // Trashed items stay guarded so a stale callback can never delete them twice.
         for (id in currentIds) {
-            if (id !in previousItemIds) {
+            if (id !in knownItemIds) {
                 committedTrashIds.remove(id)
             }
         }
-        previousItemIds = currentIds
+        knownItemIds.clear()
+        knownItemIds.addAll(currentIds)
         if (items.isNotEmpty() && pagerState.currentPage >= items.size) {
             pagerState.scrollToPage(items.lastIndex)
         }
@@ -222,36 +300,19 @@ fun MediaViewerScreen(
         }
     }
 
-    // Memory-conscious lookahead preloading for next, next + 1, and previous items.
-    val prefetchHandles = remember { LinkedHashMap<Long, CoilDisposable>() }
+    // Memory-conscious lookahead preloading for the current, next, next + 1, and previous items.
+    // The bounded LRU keeps an in-flight preload alive long enough to become the active page.
+    val prefetchCache = remember { ViewerPrefetchCache() }
     LaunchedEffect(effectivePage, items, imageLoader) {
-        val lookahead = buildList {
-            items.getOrNull(effectivePage + 1)?.let(::add)
-            items.getOrNull(effectivePage + 2)?.let(::add)
-            items.getOrNull(effectivePage - 1)?.let(::add)
-        }
-        val desiredIds = lookahead.mapTo(HashSet(lookahead.size)) { it.id }
-        val iterator = prefetchHandles.entries.iterator()
-        while (iterator.hasNext()) {
-            val entry = iterator.next()
-            if (entry.key !in desiredIds) {
-                entry.value.dispose()
-                iterator.remove()
-            }
-        }
-        for (target in lookahead) {
-            if (target.id !in prefetchHandles) {
-                prefetchHandles[target.id] = imageLoader.enqueue(
-                    buildViewerImageRequest(context, target),
-                )
-            }
-        }
+        prefetchCache.sync(
+            context = context,
+            imageLoader = imageLoader,
+            items = items,
+            page = effectivePage,
+        )
     }
     DisposableEffect(Unit) {
-        onDispose {
-            prefetchHandles.values.forEach { it.dispose() }
-            prefetchHandles.clear()
-        }
+        onDispose { prefetchCache.dispose() }
     }
 
     if (pendingDeleteItem != null) {
@@ -274,7 +335,10 @@ fun MediaViewerScreen(
     }
 
     var viewportHeightPx by remember { mutableFloatStateOf(1600f) }
-    val underlyingRestingOffsetPx = with(localDensity) { 24.dp.toPx() }
+    // Content-sized cards are centered, so any resting downward offset would let the staged next
+    // card peek out below short/landscape media. Keep the stack anchored at center; the reveal is
+    // driven purely by scale and the outgoing card's upward travel.
+    val underlyingRestingOffsetPx = 0f
     val trashConfig = rememberPhysicsVerticalSwipeConfig(
         direction = VerticalSwipeDirection.UpToDismiss,
         containerHeightPx = viewportHeightPx,
@@ -328,7 +392,11 @@ fun MediaViewerScreen(
 
     val commitTrashTransition: (Float, Float) -> Unit = { releasedOffsetY, releasedVelocityY ->
         val targetItem = latestCurrentItem
-        if (targetItem != null && !isTrashPreview && committedTrashIds.add(targetItem.id)) {
+        val isStillCurrent = targetItem != null &&
+            latestItems.any { it.id == targetItem.id }
+        if (targetItem != null && isStillCurrent && !isTrashPreview &&
+            committedTrashIds.add(targetItem.id)
+        ) {
             val hadUnderlying = latestNextItem != null
             val revealAtHandoff = if (hadUnderlying) {
                 computeStackedUnderlyingCardTransform(
@@ -341,7 +409,7 @@ fun MediaViewerScreen(
             }
 
             val exitCard = ExitingCardState(
-                instanceId = ++nextExitInstanceId,
+                instanceId = ++exitIdCounter.value,
                 item = targetItem,
                 offsetYState = mutableFloatStateOf(releasedOffsetY),
                 targetOffsetY = -trashConfig.dismissTargetOffsetPx,
@@ -349,15 +417,15 @@ fun MediaViewerScreen(
                 dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
             )
             exitingCards.add(exitCard)
-            if (exitingCards.size > 4) {
+            while (exitingCards.size > MaxExitingCards) {
                 exitingCards.removeAt(0)
             }
 
-            incomingExpansionJob?.cancel()
-            val gen = ++incomingGeneration
+            incomingExpansion.job?.cancel()
+            val gen = ++incomingExpansion.generation
             if (revealAtHandoff < 0.999f) {
                 incomingRevealProgress.floatValue = revealAtHandoff
-                incomingExpansionJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                incomingExpansion.job = scope.launch(start = CoroutineStart.UNDISPATCHED) {
                     val anim = TargetBasedAnimation(
                         animationSpec = spring(
                             dampingRatio = Spring.DampingRatioNoBouncy,
@@ -370,7 +438,7 @@ fun MediaViewerScreen(
                     var startNanos = Long.MIN_VALUE
                     while (true) {
                         val frameNanos = withFrameNanos { it }
-                        if (gen != incomingGeneration) return@launch
+                        if (gen != incomingExpansion.generation) return@launch
                         if (startNanos == Long.MIN_VALUE) {
                             startNanos = frameNanos
                         }
@@ -386,6 +454,9 @@ fun MediaViewerScreen(
                 incomingRevealProgress.floatValue = 1f
             }
 
+            // Commit to the existing Trash Bin workflow exactly once, immediately. The media list
+            // and thumbnails update from the repository's optimistic state; the viewer never waits
+            // for the exit spring or for image decoding.
             latestOnTrashItem(targetItem)
         }
     }
@@ -403,225 +474,232 @@ fun MediaViewerScreen(
             .background(Color.Black)
             .testTag("media_viewer_screen"),
     ) {
-        Column(modifier = Modifier.fillMaxSize()) {
-            // Top Header strictly outside and above the media viewport
-            ViewerTopHeader(
-                currentItem = currentItem,
-                currentIndex = effectivePage,
-                totalCount = items.size,
-                trashCount = trashCount,
-                isTrashPreview = isTrashPreview,
-                undoRedoState = undoRedoState,
-                controlsVisible = showControls || currentItem == null,
-                onBack = onBack,
-                onShowInfo = { showInfoSheet = true },
-                onOpenTrash = onOpenTrash,
-                onMoveToTrash = { currentItem?.let(triggerExitTrash) },
-                onRestore = { currentItem?.let(onRestoreItem) },
-                onPermanentDelete = { currentItem?.let { pendingDeleteItem = it } },
-                onUndo = {
-                    committedTrashIds.clear()
-                    onUndo()
-                },
-                onRedo = onRedo,
-            )
-
-            // Calculated available content viewport strictly between top header and bottom controls
-            Box(
-                contentAlignment = Alignment.Center,
-                modifier = Modifier
-                    .weight(1f)
-                    .fillMaxWidth()
-                    .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal))
-                    .clipToBounds()
-                    .onSizeChanged { size ->
-                        if (size.height > 0) viewportHeightPx = size.height.toFloat()
-                    }
-                    .testTag("viewer_media_viewport"),
-            ) {
-                if (items.isEmpty() || currentItem == null) {
-                    Column(
-                        horizontalAlignment = Alignment.CenterHorizontally,
-                        verticalArrangement = Arrangement.Center,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(24.dp),
-                    ) {
-                        Text(
-                            text = "No media remaining",
-                            style = MaterialTheme.typography.titleLarge,
-                            color = Color.White,
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                            OutlinedButton(
-                                onClick = onBack,
-                                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
-                            ) {
-                                Text("Done")
-                            }
-                            if (!isTrashPreview && undoRedoState.canUndo) {
-                                Button(
-                                    onClick = {
-                                        committedTrashIds.clear()
-                                        onUndo()
-                                    },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = Color.White,
-                                        contentColor = Color.Black,
-                                    ),
-                                ) {
-                                    Text(stringResource(R.string.undo))
-                                }
-                            }
+        // The media viewport owns the entire window. Controls float above it, so no header or
+        // bottom section reserves height away from the media.
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .fillMaxSize()
+                .clipToBounds()
+                .onSizeChanged { size ->
+                    if (size.height > 0) viewportHeightPx = size.height.toFloat()
+                }
+                .testTag("viewer_media_viewport"),
+        ) {
+            if (items.isEmpty() || currentItem == null) {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(24.dp),
+                ) {
+                    Text(
+                        text = "No media remaining",
+                        style = MaterialTheme.typography.titleLarge,
+                        color = Color.White,
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        OutlinedButton(
+                            onClick = onBack,
+                            colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                        ) {
+                            Text("Done")
                         }
-                    }
-                } else {
-                    if (nextItem != null) {
-                        StackedUnderlyingCard(
-                            item = nextItem,
-                            imageLoader = imageLoader,
-                            offsetY = trashSwipeController.offsetY,
-                            dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .zIndex(0f),
-                        )
-                    }
-
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .zIndex(1f)
-                            .physicsVerticalSwipe(
-                                controller = trashSwipeController,
-                                config = trashConfig,
-                                scope = scope,
-                                enabled = !isTrashPreview && !isCurrentZoomed,
-                                key = isTrashPreview,
-                                restPhase = VerticalSwipePhase.Idle,
-                                canEngage = {
-                                    !pagerState.isScrollInProgress &&
-                                        !isCurrentZoomed &&
-                                        !isTrashPreview &&
-                                        latestCurrentItem != null
+                        if (!isTrashPreview && undoRedoState.canUndo) {
+                            Button(
+                                onClick = {
+                                    committedTrashIds.clear()
+                                    onUndo()
                                 },
-                                pointerPass = PointerEventPass.Initial,
-                                onDismissed = {},
-                                onDismissCommit = commitTrashTransition,
-                            )
-                            .graphicsLayer {
-                                val currentOffsetY = trashSwipeController.offsetY.floatValue
-                                val dragTransform = computeStackedActiveCardTransform(
-                                    offsetY = currentOffsetY,
-                                    dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
-                                    dismissTargetOffsetPx = trashConfig.dismissTargetOffsetPx,
-                                )
-                                val expandProgress = incomingRevealProgress.floatValue.coerceIn(0f, 1f)
-                                val expandScale = 0.92f + (0.08f * expandProgress)
-                                val expandOffsetY = underlyingRestingOffsetPx * (1f - expandProgress)
-
-                                translationY = dragTransform.translationY + expandOffsetY
-                                scaleX = dragTransform.scale * expandScale
-                                scaleY = dragTransform.scale * expandScale
-                                rotationZ = dragTransform.rotationZ
-                                cameraDistance = 16f * density
+                                colors = ButtonDefaults.buttonColors(
+                                    containerColor = Color.White,
+                                    contentColor = Color.Black,
+                                ),
+                            ) {
+                                Text(stringResource(R.string.undo))
                             }
-                            .background(Color.Black)
-                            .testTag("viewer_media_card"),
-                    ) {
-                        HorizontalPager(
-                            state = pagerState,
-                            key = { page -> items[page].id },
-                            beyondViewportPageCount = 1,
-                            // Vertical drags are consumed on the Initial pass before the pager sees
-                            // them, so it is not necessary to recompose the pager when a trash drag
-                            // starts. Keeping this flag stable avoids a gesture-start frame hitch.
-                            userScrollEnabled = !isCurrentZoomed,
-                            modifier = Modifier.fillMaxSize(),
-                        ) { page ->
-                            val item = items[page]
-                            val isCurrentPage = page == effectivePage
-                            if (item.isVideo) {
-                                VideoPlayerPage(
-                                    item = item,
-                                    imageLoader = imageLoader,
-                                    isActivePage = isCurrentPage && pagerState.settledPage == page,
-                                    isCurrentPage = isCurrentPage,
-                                    onPlayerActive = { player -> activeExoPlayer = player },
-                                    onPlayerInactive = { player ->
-                                        if (activeExoPlayer === player) {
-                                            activeExoPlayer = null
-                                        }
-                                    },
-                                    onToggleControls = { showControls = !showControls },
-                                    onLongPress = { showInfoSheet = true },
-                                )
-                            } else {
-                                ZoomablePhotoPage(
-                                    item = item,
-                                    imageLoader = imageLoader,
-                                    onZoomChanged = { zoomed ->
-                                        if (page == effectivePage) {
-                                            isCurrentZoomed = zoomed
-                                        }
-                                    },
-                                    onTap = { showControls = !showControls },
-                                    onLongPress = { showInfoSheet = true },
-                                )
-                            }
-                        }
-
-                        // Matching dim fade-out during smooth incoming card expansion
-                        Box(
-                            modifier = Modifier
-                                .fillMaxSize()
-                                .graphicsLayer {
-                                    val expandProgress = incomingRevealProgress.floatValue.coerceIn(0f, 1f)
-                                    alpha = 0.45f * (1f - expandProgress)
-                                }
-                                .background(Color.Black),
-                        )
-                    }
-
-                    // Independent outgoing flight overlays so the incoming card is immediately interactive.
-                    for (idx in exitingCards.indices) {
-                        val exitCard = exitingCards[idx]
-                        key(exitCard.instanceId) {
-                            ExitingCardOverlay(
-                                exitCard = exitCard,
-                                imageLoader = imageLoader,
-                                dismissStiffness = trashConfig.dismissStiffness,
-                                dismissDampingRatio = trashConfig.dismissDampingRatio,
-                                onFinished = { exitingCards.remove(exitCard) },
-                                modifier = Modifier
-                                    .fillMaxSize()
-                                    .zIndex(2f + idx * 0.01f),
-                            )
                         }
                     }
                 }
+            } else {
+                if (nextItem != null) {
+                    StackedUnderlyingCard(
+                        item = nextItem,
+                        imageLoader = imageLoader,
+                        resolvedRatios = resolvedRatios,
+                        offsetY = trashSwipeController.offsetY,
+                        dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .zIndex(0f),
+                    )
+                }
+
+                Box(
+                    contentAlignment = Alignment.Center,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .zIndex(1f)
+                        .physicsVerticalSwipe(
+                            controller = trashSwipeController,
+                            config = trashConfig,
+                            scope = scope,
+                            enabled = !isTrashPreview && !isCurrentZoomed,
+                            key = isTrashPreview,
+                            restPhase = VerticalSwipePhase.Idle,
+                            canEngage = {
+                                !pagerState.isScrollInProgress &&
+                                    !isCurrentZoomed &&
+                                    !isTrashPreview &&
+                                    latestCurrentItem != null
+                            },
+                            pointerPass = PointerEventPass.Initial,
+                            onDismissed = {},
+                            onDismissCommit = commitTrashTransition,
+                        )
+                        .graphicsLayer {
+                            // Compute transforms inline on the draw/animation hot path so no
+                            // temporary objects are allocated every frame during a gesture.
+                            val currentOffsetY = trashSwipeController.offsetY.floatValue
+                            val dismissThreshold =
+                                trashConfig.dismissDistanceThresholdPx.coerceAtLeast(1f)
+                            val dismissTarget =
+                                trashConfig.dismissTargetOffsetPx.coerceAtLeast(1f)
+                            val liftProgress =
+                                (-currentOffsetY / dismissThreshold).coerceIn(0f, 1f)
+                            val exitProgress =
+                                (-currentOffsetY / dismissTarget).coerceIn(0f, 1f)
+                            val dragScale =
+                                1f - (liftProgress * 0.08f) - (exitProgress * 0.06f)
+                            val expandProgress =
+                                incomingRevealProgress.floatValue.coerceIn(0f, 1f)
+                            val expandScale = 0.92f + (0.08f * expandProgress)
+                            val expandOffsetY =
+                                underlyingRestingOffsetPx * (1f - expandProgress)
+
+                            translationY = currentOffsetY + expandOffsetY
+                            scaleX = dragScale * expandScale
+                            scaleY = dragScale * expandScale
+                            rotationZ =
+                                (liftProgress * 1.8f + exitProgress * 0.7f)
+                                    .coerceIn(0f, 4f)
+                            cameraDistance = 16f * density
+                        }
+                        .testTag("viewer_media_gesture_surface"),
+                ) {
+                    HorizontalPager(
+                        state = pagerState,
+                        key = { page -> items[page].id },
+                        beyondViewportPageCount = 1,
+                        // Vertical drags are consumed on the Initial pass before the pager sees
+                        // them, so it is not necessary to recompose the pager when a trash drag
+                        // starts. Keeping this flag stable avoids a gesture-start frame hitch.
+                        userScrollEnabled = !isCurrentZoomed,
+                        modifier = Modifier.fillMaxSize(),
+                    ) { page ->
+                        val item = items[page]
+                        val isCurrentPage = page == effectivePage
+                        val cardTestTag = if (isCurrentPage) "viewer_media_card" else null
+                        if (item.isVideo) {
+                            VideoPlayerPage(
+                                item = item,
+                                imageLoader = imageLoader,
+                                resolvedRatios = resolvedRatios,
+                                cardTestTag = cardTestTag,
+                                isActivePage = isCurrentPage && pagerState.settledPage == page,
+                                isCurrentPage = isCurrentPage,
+                                onPlayerActive = { player -> activeExoPlayer = player },
+                                onPlayerInactive = { player ->
+                                    if (activeExoPlayer === player) {
+                                        activeExoPlayer = null
+                                    }
+                                },
+                                onToggleControls = { showControls = !showControls },
+                                onLongPress = { showInfoSheet = true },
+                            )
+                        } else {
+                            ZoomablePhotoPage(
+                                item = item,
+                                imageLoader = imageLoader,
+                                resolvedRatios = resolvedRatios,
+                                cardTestTag = cardTestTag,
+                                onZoomChanged = { zoomed ->
+                                    if (page == effectivePage) {
+                                        isCurrentZoomed = zoomed
+                                    }
+                                },
+                                onTap = { showControls = !showControls },
+                                onLongPress = { showInfoSheet = true },
+                            )
+                        }
+                    }
+
+                    // Matching dim fade-out during smooth incoming card expansion
+                    Box(
+                        modifier = Modifier
+                            .fillMaxSize()
+                            .graphicsLayer {
+                                val expandProgress = incomingRevealProgress.floatValue.coerceIn(0f, 1f)
+                                alpha = 0.45f * (1f - expandProgress)
+                            }
+                            .background(Color.Black),
+                    )
+                }
             }
 
-            // Bottom Interface Bar strictly outside and below the media viewport
-            ViewerBottomBar(
-                currentItem = currentItem,
-                isTrashPreview = isTrashPreview,
-                activeExoPlayer = activeExoPlayer,
-                showControls = showControls,
-                trashSwipeController = trashSwipeController,
-                trashSwipeConfig = trashConfig,
-                scope = scope,
-                canSwipeUpToTrash = !isTrashPreview &&
-                    !isCurrentZoomed &&
-                    !pagerState.isScrollInProgress &&
-                    currentItem != null,
-                onSwipeUpCommit = commitTrashTransition,
-                onRestore = { currentItem?.let(onRestoreItem) },
-                onPermanentDelete = { currentItem?.let { pendingDeleteItem = it } },
+            // Independent outgoing flight overlays so the incoming card is immediately
+            // interactive. These live outside the item branch so the final card still flies
+            // out after the list becomes empty, instead of vanishing mid-transition.
+            ExitingCardsLayer(
+                exitingCards = exitingCards,
+                imageLoader = imageLoader,
+                resolvedRatios = resolvedRatios,
+                dismissStiffness = trashConfig.dismissStiffness,
+                dismissDampingRatio = trashConfig.dismissDampingRatio,
             )
         }
+
+        ViewerTopHeader(
+            currentItem = currentItem,
+            currentIndex = effectivePage,
+            totalCount = items.size,
+            trashCount = trashCount,
+            isTrashPreview = isTrashPreview,
+            undoRedoState = undoRedoState,
+            controlsVisible = showControls || currentItem == null,
+            onBack = onBack,
+            onShowInfo = { showInfoSheet = true },
+            onOpenTrash = onOpenTrash,
+            onMoveToTrash = { currentItem?.let(triggerExitTrash) },
+            onRestore = { currentItem?.let(onRestoreItem) },
+            onPermanentDelete = { currentItem?.let { pendingDeleteItem = it } },
+            onUndo = {
+                committedTrashIds.clear()
+                onUndo()
+            },
+            onRedo = onRedo,
+            modifier = Modifier.align(Alignment.TopCenter),
+        )
+
+        ViewerBottomBar(
+            currentItem = currentItem,
+            isTrashPreview = isTrashPreview,
+            activeExoPlayer = activeExoPlayer,
+            showControls = showControls,
+            trashSwipeController = trashSwipeController,
+            trashSwipeConfig = trashConfig,
+            scope = scope,
+            canSwipeUpToTrash = !isTrashPreview &&
+                !isCurrentZoomed &&
+                !pagerState.isScrollInProgress &&
+                currentItem != null,
+            onSwipeUpCommit = commitTrashTransition,
+            onRestore = { currentItem?.let(onRestoreItem) },
+            onPermanentDelete = { currentItem?.let { pendingDeleteItem = it } },
+            modifier = Modifier.align(Alignment.BottomCenter),
+        )
     }
 }
 
@@ -642,18 +720,31 @@ private fun ViewerTopHeader(
     onPermanentDelete: () -> Unit,
     onUndo: () -> Unit,
     onRedo: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     var showMoreMenu by remember { mutableStateOf(false) }
 
-    Surface(
-        color = Color.Black,
-        modifier = Modifier
+    // The header floats above the media. Only the controls themselves occupy space; when they
+    // fade out nothing is reserved over the preview.
+    AnimatedVisibility(
+        visible = controlsVisible,
+        enter = fadeIn(),
+        exit = fadeOut(),
+        modifier = modifier
             .fillMaxWidth()
             .zIndex(1f),
     ) {
         Box(
             modifier = Modifier
                 .fillMaxWidth()
+                .background(
+                    Brush.verticalGradient(
+                        colors = listOf(
+                            Color.Black.copy(alpha = 0.62f),
+                            Color.Transparent,
+                        ),
+                    ),
+                )
                 .windowInsetsPadding(
                     WindowInsets.safeDrawing.only(
                         WindowInsetsSides.Top + WindowInsetsSides.Horizontal,
@@ -661,174 +752,168 @@ private fun ViewerTopHeader(
                 )
                 .heightIn(min = 56.dp),
         ) {
-            AnimatedVisibility(
-                visible = controlsVisible,
-                enter = fadeIn(),
-                exit = fadeOut(),
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .heightIn(min = 56.dp)
+                    .padding(horizontal = 8.dp, vertical = 4.dp),
             ) {
-                Row(
-                    verticalAlignment = Alignment.CenterVertically,
+                IconButton(
+                    onClick = onBack,
                     modifier = Modifier
-                        .fillMaxWidth()
-                        .heightIn(min = 56.dp)
-                        .padding(horizontal = 8.dp, vertical = 4.dp),
+                        .minimumInteractiveComponentSize()
+                        .testTag("viewer_back_button"),
                 ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                        contentDescription = "Back",
+                        tint = Color.White,
+                    )
+                }
+
+                Column(modifier = Modifier.weight(1f)) {
+                    if (currentItem != null) {
+                        Text(
+                            text = Formatters.formatFullDateTime(currentItem.effectiveTimestampMillis),
+                            style = MaterialTheme.typography.titleSmall,
+                            color = Color.White,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                        Text(
+                            text = "${currentIndex + 1} / $totalCount",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = Color.White.copy(alpha = 0.75f),
+                            maxLines = 1,
+                        )
+                    }
+                }
+
+                if (currentItem != null) {
                     IconButton(
-                        onClick = onBack,
+                        onClick = onShowInfo,
                         modifier = Modifier
                             .minimumInteractiveComponentSize()
-                            .testTag("viewer_back_button"),
+                            .testTag("viewer_info_button"),
                     ) {
                         Icon(
-                            imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
-                            contentDescription = "Back",
+                            imageVector = Icons.Outlined.Info,
+                            contentDescription = "Media information",
                             tint = Color.White,
                         )
                     }
+                }
 
-                    Column(modifier = Modifier.weight(1f)) {
-                        if (currentItem != null) {
-                            Text(
-                                text = Formatters.formatFullDateTime(currentItem.effectiveTimestampMillis),
-                                style = MaterialTheme.typography.titleSmall,
-                                color = Color.White,
-                                maxLines = 1,
-                                overflow = TextOverflow.Ellipsis,
-                            )
-                            Text(
-                                text = "${currentIndex + 1} / $totalCount",
-                                style = MaterialTheme.typography.bodySmall,
-                                color = Color.White.copy(alpha = 0.75f),
-                                maxLines = 1,
-                            )
-                        }
-                    }
-
-                    if (currentItem != null) {
-                        IconButton(
-                            onClick = onShowInfo,
-                            modifier = Modifier
-                                .minimumInteractiveComponentSize()
-                                .testTag("viewer_info_button"),
+                IconButton(
+                    onClick = onOpenTrash,
+                    modifier = Modifier
+                        .minimumInteractiveComponentSize()
+                        .testTag("viewer_trash_button"),
+                ) {
+                    if (trashCount > 0) {
+                        BadgedBox(
+                            badge = {
+                                Badge(
+                                    containerColor = Color.White,
+                                    contentColor = Color.Black,
+                                    modifier = Modifier.testTag("viewer_trash_badge"),
+                                ) {
+                                    Text(
+                                        text = if (trashCount > 99) "99+" else trashCount.toString(),
+                                        style = MaterialTheme.typography.labelSmall,
+                                    )
+                                }
+                            },
                         ) {
                             Icon(
-                                imageVector = Icons.Outlined.Info,
-                                contentDescription = "Media information",
+                                imageVector = Icons.Outlined.DeleteOutline,
+                                contentDescription = stringResource(R.string.trash_bin_count_cd, trashCount),
                                 tint = Color.White,
                             )
                         }
+                    } else {
+                        Icon(
+                            imageVector = Icons.Outlined.DeleteOutline,
+                            contentDescription = stringResource(R.string.trash_bin_empty_cd),
+                            tint = Color.White.copy(alpha = 0.72f),
+                        )
                     }
+                }
 
-                    IconButton(
-                        onClick = onOpenTrash,
-                        modifier = Modifier
-                            .minimumInteractiveComponentSize()
-                            .testTag("viewer_trash_button"),
-                    ) {
-                        if (trashCount > 0) {
-                            BadgedBox(
-                                badge = {
-                                    Badge(
-                                        containerColor = Color.White,
-                                        contentColor = Color.Black,
-                                        modifier = Modifier.testTag("viewer_trash_badge"),
-                                    ) {
-                                        Text(
-                                            text = if (trashCount > 99) "99+" else trashCount.toString(),
-                                            style = MaterialTheme.typography.labelSmall,
-                                        )
-                                    }
-                                },
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.DeleteOutline,
-                                    contentDescription = stringResource(R.string.trash_bin_count_cd, trashCount),
-                                    tint = Color.White,
-                                )
-                            }
-                        } else {
+                if (currentItem != null) {
+                    Box {
+                        IconButton(
+                            onClick = { showMoreMenu = true },
+                            modifier = Modifier
+                                .minimumInteractiveComponentSize()
+                                .testTag("viewer_more_button"),
+                        ) {
                             Icon(
-                                imageVector = Icons.Outlined.DeleteOutline,
-                                contentDescription = stringResource(R.string.trash_bin_empty_cd),
-                                tint = Color.White.copy(alpha = 0.72f),
+                                imageVector = Icons.Outlined.MoreVert,
+                                contentDescription = "More actions",
+                                tint = Color.White,
                             )
                         }
-                    }
-
-                    if (currentItem != null) {
-                        Box {
-                            IconButton(
-                                onClick = { showMoreMenu = true },
-                                modifier = Modifier
-                                    .minimumInteractiveComponentSize()
-                                    .testTag("viewer_more_button"),
-                            ) {
-                                Icon(
-                                    imageVector = Icons.Outlined.MoreVert,
-                                    contentDescription = "More actions",
-                                    tint = Color.White,
+                        DropdownMenu(
+                            expanded = showMoreMenu,
+                            onDismissRequest = { showMoreMenu = false },
+                        ) {
+                            if (isTrashPreview) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.restore)) },
+                                    leadingIcon = {
+                                        Icon(Icons.Outlined.RestoreFromTrash, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        onRestore()
+                                    },
                                 )
-                            }
-                            DropdownMenu(
-                                expanded = showMoreMenu,
-                                onDismissRequest = { showMoreMenu = false },
-                            ) {
-                                if (isTrashPreview) {
+                                DropdownMenuItem(
+                                    text = { Text(stringResource(R.string.delete_permanently_action)) },
+                                    leadingIcon = {
+                                        Icon(Icons.Outlined.DeleteForever, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        onPermanentDelete()
+                                    },
+                                )
+                            } else {
+                                DropdownMenuItem(
+                                    text = { Text("Move to trash") },
+                                    leadingIcon = {
+                                        Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
+                                    },
+                                    onClick = {
+                                        showMoreMenu = false
+                                        onMoveToTrash()
+                                    },
+                                )
+                                if (undoRedoState.canUndo) {
                                     DropdownMenuItem(
-                                        text = { Text(stringResource(R.string.restore)) },
+                                        text = { Text(stringResource(R.string.undo)) },
                                         leadingIcon = {
-                                            Icon(Icons.Outlined.RestoreFromTrash, contentDescription = null)
+                                            Icon(Icons.AutoMirrored.Outlined.Undo, contentDescription = null)
                                         },
                                         onClick = {
                                             showMoreMenu = false
-                                            onRestore()
+                                            onUndo()
                                         },
                                     )
+                                }
+                                if (undoRedoState.canRedo) {
                                     DropdownMenuItem(
-                                        text = { Text(stringResource(R.string.delete_permanently_action)) },
+                                        text = { Text(stringResource(R.string.redo)) },
                                         leadingIcon = {
-                                            Icon(Icons.Outlined.DeleteForever, contentDescription = null)
+                                            Icon(Icons.AutoMirrored.Outlined.Redo, contentDescription = null)
                                         },
                                         onClick = {
                                             showMoreMenu = false
-                                            onPermanentDelete()
+                                            onRedo()
                                         },
                                     )
-                                } else {
-                                    DropdownMenuItem(
-                                        text = { Text("Move to trash") },
-                                        leadingIcon = {
-                                            Icon(Icons.Outlined.DeleteOutline, contentDescription = null)
-                                        },
-                                        onClick = {
-                                            showMoreMenu = false
-                                            onMoveToTrash()
-                                        },
-                                    )
-                                    if (undoRedoState.canUndo) {
-                                        DropdownMenuItem(
-                                            text = { Text(stringResource(R.string.undo)) },
-                                            leadingIcon = {
-                                                Icon(Icons.AutoMirrored.Outlined.Undo, contentDescription = null)
-                                            },
-                                            onClick = {
-                                                showMoreMenu = false
-                                                onUndo()
-                                            },
-                                        )
-                                    }
-                                    if (undoRedoState.canRedo) {
-                                        DropdownMenuItem(
-                                            text = { Text(stringResource(R.string.redo)) },
-                                            leadingIcon = {
-                                                Icon(Icons.AutoMirrored.Outlined.Redo, contentDescription = null)
-                                            },
-                                            onClick = {
-                                                showMoreMenu = false
-                                                onRedo()
-                                            },
-                                        )
-                                    }
                                 }
                             }
                         }
@@ -852,13 +937,15 @@ private fun ViewerBottomBar(
     onSwipeUpCommit: (Float, Float) -> Unit,
     onRestore: () -> Unit,
     onPermanentDelete: () -> Unit,
+    modifier: Modifier = Modifier,
 ) {
     val controlsVisible = showControls &&
         trashSwipeController.phase != VerticalSwipePhase.Dragging &&
         trashSwipeController.phase != VerticalSwipePhase.Dismissed
+    // Transparent overlay: the bars never subtract height from the media viewport.
     Surface(
-        color = Color.Black,
-        modifier = Modifier
+        color = Color.Transparent,
+        modifier = modifier
             .fillMaxWidth()
             .zIndex(1f)
             .physicsVerticalSwipe(
@@ -887,11 +974,11 @@ private fun ViewerBottomBar(
                 return@Box
             }
 
-            val minReservedHeight = when {
+            val minControlsHeight = when {
                 isTrashPreview && currentItem.isVideo -> 164.dp
                 currentItem.isVideo -> 104.dp
                 isTrashPreview -> 68.dp
-                // Only the drag handle remains for photos; the swipe hint used to reserve 52.dp.
+                // Only the drag handle remains for photos; it overlays the media bottom edge.
                 else -> 12.dp
             }
 
@@ -899,7 +986,7 @@ private fun ViewerBottomBar(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
                     .fillMaxWidth()
-                    .heightIn(min = minReservedHeight),
+                    .heightIn(min = minControlsHeight),
             ) {
                 AnimatedVisibility(
                     visible = controlsVisible,
@@ -908,7 +995,16 @@ private fun ViewerBottomBar(
                 ) {
                     Column(
                         horizontalAlignment = Alignment.CenterHorizontally,
-                        modifier = Modifier.fillMaxWidth(),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .background(
+                                Brush.verticalGradient(
+                                    colors = listOf(
+                                        Color.Transparent,
+                                        Color.Black.copy(alpha = 0.62f),
+                                    ),
+                                ),
+                            ),
                     ) {
                         if (!isTrashPreview) {
                             Box(
@@ -1165,6 +1261,11 @@ internal fun buildViewerImageRequest(
                 videoFrameMillis(500L)
             }
         }
+        .setParameter(
+            ViewerImageRequestParameter,
+            "viewer:${item.id}:${item.contentUri}:$maxDimensionPx",
+            memoryCacheKey = null,
+        )
         .size(maxDimensionPx)
         .precision(Precision.INEXACT)
         .crossfade(false)
@@ -1181,15 +1282,41 @@ private data class ExitingCardState(
 )
 
 @Composable
+private fun ExitingCardsLayer(
+    exitingCards: SnapshotStateList<ExitingCardState>,
+    imageLoader: ImageLoader,
+    resolvedRatios: MutableMap<Long, Float>,
+    dismissStiffness: Float,
+    dismissDampingRatio: Float,
+) {
+    for (idx in exitingCards.indices) {
+        val exitCard = exitingCards[idx]
+        key(exitCard.instanceId) {
+            ExitingCardOverlay(
+                exitCard = exitCard,
+                imageLoader = imageLoader,
+                resolvedRatios = resolvedRatios,
+                dismissStiffness = dismissStiffness,
+                dismissDampingRatio = dismissDampingRatio,
+                onFinished = { exitingCards.remove(exitCard) },
+                modifier = Modifier
+                    .fillMaxSize()
+                    .zIndex(2f + idx * 0.01f),
+            )
+        }
+    }
+}
+
+@Composable
 private fun ExitingCardOverlay(
     exitCard: ExitingCardState,
     imageLoader: ImageLoader,
+    resolvedRatios: MutableMap<Long, Float>,
     dismissStiffness: Float,
     dismissDampingRatio: Float,
     onFinished: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val context = LocalContext.current
     val density = LocalDensity.current
 
     LaunchedEffect(exitCard.instanceId) {
@@ -1226,37 +1353,29 @@ private fun ExitingCardOverlay(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .graphicsLayer {
-                val transform = computeStackedActiveCardTransform(
-                    offsetY = exitCard.offsetYState.floatValue,
-                    dismissDistanceThresholdPx = exitCard.dismissDistanceThresholdPx,
-                    dismissTargetOffsetPx = -exitCard.targetOffsetY,
-                )
-                translationY = transform.translationY
-                scaleX = transform.scale
-                scaleY = transform.scale
-                rotationZ = transform.rotationZ
+                val offsetY = exitCard.offsetYState.floatValue
+                val dismissThreshold =
+                    exitCard.dismissDistanceThresholdPx.coerceAtLeast(1f)
+                val dismissTarget = (-exitCard.targetOffsetY).coerceAtLeast(1f)
+                val liftProgress = (-offsetY / dismissThreshold).coerceIn(0f, 1f)
+                val exitProgress = (-offsetY / dismissTarget).coerceIn(0f, 1f)
+
+                translationY = offsetY
+                val scale = 1f - (liftProgress * 0.08f) - (exitProgress * 0.06f)
+                scaleX = scale
+                scaleY = scale
+                rotationZ = (liftProgress * 1.8f + exitProgress * 0.7f).coerceIn(0f, 4f)
                 cameraDistance = 16f * density.density
             }
-            .background(Color.Black)
             .testTag("viewer_exiting_card_${exitCard.item.id}"),
     ) {
-        if (exitCard.item.isVideo) {
-            val request = remember(exitCard.item.id, exitCard.item.contentUri) {
-                buildViewerImageRequest(context, exitCard.item)
-            }
-            AsyncImage(
-                model = request,
-                imageLoader = imageLoader,
-                contentDescription = exitCard.item.displayName,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            LayeredPhotoContent(
-                item = exitCard.item,
-                imageLoader = imageLoader,
-            )
-        }
+        AdaptivePhotoCard(
+            item = exitCard.item,
+            imageLoader = imageLoader,
+            resolvedRatios = resolvedRatios,
+            modifier = Modifier.fillMaxSize(),
+            cardTestTag = "viewer_exiting_media_card_${exitCard.item.id}",
+        )
     }
 }
 
@@ -1264,12 +1383,12 @@ private fun ExitingCardOverlay(
 private fun StackedUnderlyingCard(
     item: MediaItem,
     imageLoader: ImageLoader,
+    resolvedRatios: MutableMap<Long, Float>,
     offsetY: FloatState,
     dismissDistanceThresholdPx: Float,
     modifier: Modifier = Modifier,
 ) {
-    val context = LocalContext.current
-    val restingOffsetPx = with(LocalDensity.current) { 24.dp.toPx() }
+    val restingOffsetPx = 0f
     val revealDistancePx = (dismissDistanceThresholdPx * 1.45f).coerceAtLeast(1f)
 
     Box(
@@ -1281,29 +1400,19 @@ private fun StackedUnderlyingCard(
                 scaleX = scale
                 scaleY = scale
                 translationY = restingOffsetPx * (1f - revealProgress)
+                // A staged card with a different aspect ratio can be larger than the active card.
+                // Keep it fully hidden at rest and fade it in only while the active card is moving.
+                alpha = revealProgress
             }
-            .background(Color.Black)
             .testTag("viewer_underlying_card"),
     ) {
-        if (item.isVideo) {
-            val request = remember(item.id, item.contentUri) {
-                buildViewerImageRequest(context, item)
-            }
-            AsyncImage(
-                model = request,
-                imageLoader = imageLoader,
-                contentDescription = item.displayName,
-                contentScale = ContentScale.Fit,
-                modifier = Modifier.fillMaxSize(),
-            )
-        } else {
-            LayeredPhotoContent(
-                item = item,
-                imageLoader = imageLoader,
-                backdropTestTag = "viewer_underlying_backdrop_${item.id}",
-                foregroundTestTag = "viewer_underlying_foreground_${item.id}",
-            )
-        }
+        AdaptivePhotoCard(
+            item = item,
+            imageLoader = imageLoader,
+            resolvedRatios = resolvedRatios,
+            modifier = Modifier.fillMaxSize(),
+            cardTestTag = "viewer_underlying_media_card_${item.id}",
+        )
         Box(
             modifier = Modifier
                 .fillMaxSize()
@@ -1317,84 +1426,126 @@ private fun StackedUnderlyingCard(
     }
 }
 
+/**
+ * Displays exactly one copy of the media inside a card whose size follows the media's intrinsic
+ * aspect ratio. The card is centered in the available viewport and is never cropped, stretched, or
+ * padded with a blurred backdrop.
+ */
 @Composable
-private fun LayeredPhotoContent(
+private fun AdaptivePhotoCard(
     item: MediaItem,
     imageLoader: ImageLoader,
+    resolvedRatios: MutableMap<Long, Float>,
     modifier: Modifier = Modifier,
-    foregroundScale: () -> Float = { 1f },
-    foregroundOffset: () -> Offset = { Offset.Zero },
-    backdropTestTag: String? = null,
-    foregroundTestTag: String? = null,
+    imageModifier: Modifier = Modifier,
+    cardTestTag: String? = null,
+    imageTestTag: String? = null,
+    onCardSizeChanged: (IntSize) -> Unit = {},
 ) {
     val context = LocalContext.current
     val request = remember(item.id, item.contentUri, item.isVideo) {
         buildViewerImageRequest(context, item)
     }
-    // Single painter shared by both background and foreground Image composables so Coil decodes once.
     val painter = rememberAsyncImagePainter(
         model = request,
         imageLoader = imageLoader,
         contentScale = ContentScale.Fit,
     )
-
-    Box(
-        contentAlignment = Alignment.Center,
-        modifier = modifier
-            .fillMaxSize()
-            .clipToBounds(),
+    // The decoded painter's intrinsic size is authoritative: Coil applies EXIF rotation before the
+    // drawable is exposed, so a portrait photo stored as a rotated landscape buffer still reports
+    // a portrait ratio here. MediaStore width/height is only the pre-decode fallback.
+    val intrinsicSize = painter.intrinsicSize
+    val decodedRatio = if (
+        intrinsicSize.isSpecified &&
+        intrinsicSize.width.isFinite() &&
+        intrinsicSize.height.isFinite() &&
+        intrinsicSize.width > 0f &&
+        intrinsicSize.height > 0f
     ) {
-        Image(
-            painter = painter,
-            contentDescription = null,
-            contentScale = ContentScale.Crop,
-            modifier = Modifier
-                .fillMaxSize()
-                .let { base ->
-                    if (backdropTestTag != null) base.testTag(backdropTestTag) else base
-                }
-                .graphicsLayer {
-                    scaleX = 1.08f
-                    scaleY = 1.08f
-                    alpha = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) 0.48f else 0.28f
-                }
-                .then(
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                        Modifier.blur(
-                            radius = 28.dp,
-                            edgeTreatment = BlurredEdgeTreatment.Rectangle,
-                        )
-                    } else {
-                        Modifier
-                    },
-                ),
-        )
+        intrinsicSize.width / intrinsicSize.height
+    } else {
+        null
+    }
+    LaunchedEffect(item.id, decodedRatio) {
+        if (decodedRatio != null) {
+            resolvedRatios[item.id] = decodedRatio
+        }
+    }
 
+    AdaptiveMediaFrame(
+        ratio = decodedRatio ?: resolvedRatios[item.id] ?: item.viewerAspectRatio(),
+        modifier = modifier,
+        cardTestTag = cardTestTag,
+        onCardSizeChanged = onCardSizeChanged,
+    ) {
         Image(
             painter = painter,
             contentDescription = item.displayName,
             contentScale = ContentScale.Fit,
             modifier = Modifier
                 .fillMaxSize()
-                .let { base ->
-                    if (foregroundTestTag != null) base.testTag(foregroundTestTag) else base
-                }
-                .graphicsLayer {
-                    val s = foregroundScale()
-                    val o = foregroundOffset()
-                    scaleX = s
-                    scaleY = s
-                    translationX = o.x
-                    translationY = o.y
-                },
+                .then(if (imageTestTag != null) Modifier.testTag(imageTestTag) else Modifier)
+                .then(imageModifier),
         )
     }
+}
+
+/** Centers a card sized from [ratio] inside the full-size viewport without reserving extra space. */
+@Composable
+private fun AdaptiveMediaFrame(
+    ratio: Float?,
+    modifier: Modifier = Modifier,
+    cardTestTag: String? = null,
+    onCardSizeChanged: (IntSize) -> Unit = {},
+    content: @Composable () -> Unit,
+) {
+    BoxWithConstraints(
+        contentAlignment = Alignment.Center,
+        modifier = modifier.fillMaxSize(),
+    ) {
+        val safeRatio = ratio?.takeIf { it.isFinite() && it > 0f }
+        val bounded = maxWidth.value.isFinite() &&
+            maxHeight.value.isFinite() &&
+            maxWidth.value > 0f &&
+            maxHeight.value > 0f
+        val cardModifier = if (safeRatio == null || !bounded) {
+            Modifier.fillMaxSize()
+        } else {
+            val containerRatio = maxWidth.value / maxHeight.value
+            if (containerRatio > safeRatio) {
+                // Height-limited media (e.g. tall portraits): fill the height, keep natural width.
+                Modifier
+                    .width(maxHeight * safeRatio)
+                    .height(maxHeight)
+            } else {
+                // Width-limited media (e.g. landscapes and squares): keep natural height.
+                Modifier
+                    .width(maxWidth)
+                    .height(maxWidth / safeRatio)
+            }
+        }
+        Box(
+            modifier = cardModifier
+                .then(if (cardTestTag != null) Modifier.testTag(cardTestTag) else Modifier)
+                .onSizeChanged(onCardSizeChanged),
+        ) {
+            content()
+        }
+    }
+}
+
+private fun MediaItem.viewerAspectRatio(): Float? {
+    if (width <= 0 || height <= 0) return null
+    val ratio = width.toFloat() / height.toFloat()
+    return ratio.takeIf { it.isFinite() && it > 0f }
 }
 
 @Composable
 private fun ZoomablePhotoPage(
     item: MediaItem,
     imageLoader: ImageLoader,
+    resolvedRatios: MutableMap<Long, Float>,
+    cardTestTag: String?,
     onZoomChanged: (Boolean) -> Unit,
     onTap: () -> Unit,
     onLongPress: () -> Unit,
@@ -1402,15 +1553,20 @@ private fun ZoomablePhotoPage(
     var scale by remember(item.id) { mutableFloatStateOf(1f) }
     var offset by remember(item.id) { mutableStateOf(Offset.Zero) }
     var containerSize by remember { mutableStateOf(IntSize.Zero) }
+    var cardSize by remember(item.id) { mutableStateOf(IntSize.Zero) }
 
     LaunchedEffect(scale) {
         onZoomChanged(scale > 1.02f)
     }
 
     fun clampOffset(candidate: Offset, currentScale: Float): Offset {
-        if (currentScale <= 1f || containerSize == IntSize.Zero) return Offset.Zero
-        val maxX = ((currentScale - 1f) * containerSize.width) / 2f
-        val maxY = ((currentScale - 1f) * containerSize.height) / 2f
+        if (currentScale <= 1f || containerSize == IntSize.Zero || cardSize == IntSize.Zero) {
+            return Offset.Zero
+        }
+        // Keep the viewport filled in each axis; an axis whose scaled card is smaller than the
+        // viewport stays centered instead of allowing the photo to be dragged off-screen.
+        val maxX = ((cardSize.width * currentScale - containerSize.width) / 2f).coerceAtLeast(0f)
+        val maxY = ((cardSize.height * currentScale - containerSize.height) / 2f).coerceAtLeast(0f)
         return Offset(
             x = candidate.x.coerceIn(-maxX, maxX),
             y = candidate.y.coerceIn(-maxY, maxY),
@@ -1468,13 +1624,20 @@ private fun ZoomablePhotoPage(
                 }
             },
     ) {
-        LayeredPhotoContent(
+        AdaptivePhotoCard(
             item = item,
             imageLoader = imageLoader,
-            foregroundScale = { scale },
-            foregroundOffset = { offset },
-            backdropTestTag = "viewer_photo_backdrop_${item.id}",
-            foregroundTestTag = "viewer_photo_foreground_${item.id}",
+            resolvedRatios = resolvedRatios,
+            modifier = Modifier.fillMaxSize(),
+            imageModifier = Modifier.graphicsLayer {
+                scaleX = scale
+                scaleY = scale
+                translationX = offset.x
+                translationY = offset.y
+            },
+            cardTestTag = cardTestTag,
+            imageTestTag = "viewer_photo_image_${item.id}",
+            onCardSizeChanged = { cardSize = it },
         )
     }
 }
@@ -1483,6 +1646,8 @@ private fun ZoomablePhotoPage(
 private fun VideoPlayerPage(
     item: MediaItem,
     imageLoader: ImageLoader,
+    resolvedRatios: MutableMap<Long, Float>,
+    cardTestTag: String?,
     isActivePage: Boolean,
     isCurrentPage: Boolean,
     onPlayerActive: (ExoPlayer) -> Unit,
@@ -1504,87 +1669,91 @@ private fun VideoPlayerPage(
             ),
     ) {
         if (!isCurrentPage) {
-            val request = remember(item.id, item.contentUri) {
-                buildViewerImageRequest(context, item)
-            }
-            AsyncImage(
-                model = request,
+            AdaptivePhotoCard(
+                item = item,
                 imageLoader = imageLoader,
-                contentDescription = item.displayName,
-                contentScale = ContentScale.Fit,
+                resolvedRatios = resolvedRatios,
                 modifier = Modifier.fillMaxSize(),
+                cardTestTag = cardTestTag,
+                imageTestTag = "viewer_video_frame_${item.id}",
             )
         } else {
-            val lifecycleOwner = LocalLifecycleOwner.current
-            val exoPlayer = remember(item.contentUri) {
-                ExoPlayer.Builder(context).build().apply {
-                    setMediaItem(androidx.media3.common.MediaItem.fromUri(item.contentUri))
-                    repeatMode = Player.REPEAT_MODE_ONE
-                    prepare()
+            AdaptiveMediaFrame(
+                ratio = resolvedRatios[item.id] ?: item.viewerAspectRatio(),
+                modifier = Modifier.fillMaxSize(),
+                cardTestTag = cardTestTag,
+            ) {
+                val lifecycleOwner = LocalLifecycleOwner.current
+                val exoPlayer = remember(item.contentUri) {
+                    ExoPlayer.Builder(context).build().apply {
+                        setMediaItem(androidx.media3.common.MediaItem.fromUri(item.contentUri))
+                        repeatMode = Player.REPEAT_MODE_ONE
+                        prepare()
+                    }
                 }
-            }
 
-            DisposableEffect(exoPlayer) {
-                onDispose {
-                    onPlayerInactive(exoPlayer)
-                    exoPlayer.release()
+                DisposableEffect(exoPlayer) {
+                    onDispose {
+                        onPlayerInactive(exoPlayer)
+                        exoPlayer.release()
+                    }
                 }
-            }
 
-            DisposableEffect(isCurrentPage, exoPlayer) {
-                onPlayerActive(exoPlayer)
-                onDispose {
-                    onPlayerInactive(exoPlayer)
+                DisposableEffect(isCurrentPage, exoPlayer) {
+                    onPlayerActive(exoPlayer)
+                    onDispose {
+                        onPlayerInactive(exoPlayer)
+                    }
                 }
-            }
 
-            DisposableEffect(lifecycleOwner, exoPlayer) {
-                val observer = LifecycleEventObserver { _, event ->
-                    if (event == Lifecycle.Event.ON_STOP || event == Lifecycle.Event.ON_PAUSE) {
+                DisposableEffect(lifecycleOwner, exoPlayer) {
+                    val observer = LifecycleEventObserver { _, event ->
+                        if (event == Lifecycle.Event.ON_STOP || event == Lifecycle.Event.ON_PAUSE) {
+                            exoPlayer.pause()
+                        }
+                    }
+                    lifecycleOwner.lifecycle.addObserver(observer)
+                    onDispose {
+                        lifecycleOwner.lifecycle.removeObserver(observer)
+                    }
+                }
+
+                // Autoplay with audio when settled on this video page
+                LaunchedEffect(isActivePage, exoPlayer) {
+                    if (isActivePage) {
+                        exoPlayer.playWhenReady = true
+                        exoPlayer.play()
+                    } else {
+                        exoPlayer.playWhenReady = false
                         exoPlayer.pause()
                     }
                 }
-                lifecycleOwner.lifecycle.addObserver(observer)
-                onDispose {
-                    lifecycleOwner.lifecycle.removeObserver(observer)
-                }
-            }
 
-            // Autoplay with audio when settled on this video page
-            LaunchedEffect(isActivePage, exoPlayer) {
-                if (isActivePage) {
-                    exoPlayer.playWhenReady = true
-                    exoPlayer.play()
-                } else {
-                    exoPlayer.playWhenReady = false
-                    exoPlayer.pause()
-                }
+                AndroidView(
+                    factory = { ctx ->
+                        val view = LayoutInflater.from(ctx)
+                            .inflate(R.layout.viewer_player_view, null, false) as PlayerView
+                        view.apply {
+                            useController = false
+                            isClickable = false
+                            isFocusable = false
+                            resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                            layoutParams = ViewGroup.LayoutParams(
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                                ViewGroup.LayoutParams.MATCH_PARENT,
+                            )
+                            player = exoPlayer
+                        }
+                    },
+                    update = { playerView ->
+                        playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
+                        if (playerView.player !== exoPlayer) {
+                            playerView.player = exoPlayer
+                        }
+                    },
+                    modifier = Modifier.fillMaxSize(),
+                )
             }
-
-            AndroidView(
-                factory = { ctx ->
-                    val view = LayoutInflater.from(ctx)
-                        .inflate(R.layout.viewer_player_view, null, false) as PlayerView
-                    view.apply {
-                        useController = false
-                        isClickable = false
-                        isFocusable = false
-                        resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                        layoutParams = ViewGroup.LayoutParams(
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                            ViewGroup.LayoutParams.MATCH_PARENT,
-                        )
-                        player = exoPlayer
-                    }
-                },
-                update = { playerView ->
-                    playerView.resizeMode = AspectRatioFrameLayout.RESIZE_MODE_FIT
-                    if (playerView.player !== exoPlayer) {
-                        playerView.player = exoPlayer
-                    }
-                },
-                modifier = Modifier.fillMaxSize(),
-            )
         }
     }
 }

@@ -78,12 +78,90 @@ import coil.ImageLoader
 import coil.compose.AsyncImage
 import coil.decode.VideoFrameDecoder
 import coil.disk.DiskCache
+import coil.intercept.Interceptor
 import coil.memory.MemoryCache
 import coil.request.ImageRequest
+import coil.request.ImageResult
 import coil.request.videoFrameMillis
 import com.example.R
 import com.example.model.MediaItem
 import com.example.util.Formatters
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+
+/**
+ * Carries a stable in-flight sharing key for full-screen viewer requests. Only requests tagged with
+ * this parameter participate in request sharing, so the viewer's active card, staged card,
+ * preload and outgoing-card copies of the same media share one decode instead of racing.
+ *
+ * The `memoryCacheKey = null` argument keeps the sharing key out of Coil's memory-cache extras.
+ */
+internal const val ViewerImageRequestParameter = "sweep.viewer.image_request"
+
+/**
+ * Coil 2 does not merge concurrent requests for the same image. The viewer often asks for the same
+ * item from two or three layers at once (incoming page, under-card, preload, exiting overlay).
+ * Without sharing, each layer decodes the full-size bitmap independently, which is the main source
+ * of jank and late incoming images during rapid swipes.
+ *
+ * The first request becomes the owner and performs the load. Identical requests wait for it to
+ * finish, then re-enter the chain themselves so they receive their own cache hit instead of
+ * adopting another layer's drawable. If the owner is cancelled or fails, waiters proceed on their
+ * own so a fast page change can never strand an upcoming image.
+ */
+private class ViewerRequestSharingInterceptor : Interceptor {
+    private val lock = Any()
+    private val inFlight = HashMap<String, CompletableDeferred<ImageResult>>()
+
+    override suspend fun intercept(chain: Interceptor.Chain): ImageResult {
+        val request = chain.request
+        // A fresh ImageRequest has no computed memory-cache key yet, so share using the explicit
+        // key recorded when the viewer request is built.
+        val shareKey = request.parameters.value<String>(ViewerImageRequestParameter)
+            ?: return chain.proceed(request)
+
+        val shared: CompletableDeferred<ImageResult>
+        val isOwner: Boolean
+        synchronized(lock) {
+            val existing = inFlight[shareKey]
+            if (existing != null) {
+                shared = existing
+                isOwner = false
+            } else {
+                shared = CompletableDeferred()
+                inFlight[shareKey] = shared
+                isOwner = true
+            }
+        }
+
+        if (!isOwner) {
+            try {
+                shared.await()
+            } catch (cancellation: CancellationException) {
+                // Only propagate cancellation that belongs to this request. If the owner was
+                // cancelled, this waiter is still active and should perform the load itself.
+                currentCoroutineContext().ensureActive()
+            } catch (_: Exception) {
+                // The owner failed; this request can still succeed on its own.
+            }
+            // Re-enter the chain after the owner has populated the caches. Waiting here still
+            // prevents concurrent duplicate decodes, but each request keeps ownership of the
+            // result it renders, so one layer leaving composition cannot blank another.
+            return chain.proceed(request)
+        }
+
+        return try {
+            chain.proceed(request).also { shared.complete(it) }
+        } catch (error: Throwable) {
+            shared.completeExceptionally(error)
+            throw error
+        } finally {
+            synchronized(lock) { inFlight.remove(shareKey) }
+        }
+    }
+}
 
 object SweepImageLoaderFactory {
     @Volatile
@@ -94,6 +172,7 @@ object SweepImageLoaderFactory {
             instance ?: ImageLoader.Builder(context.applicationContext)
                 .components {
                     add(VideoFrameDecoder.Factory())
+                    add(ViewerRequestSharingInterceptor())
                 }
                 .memoryCache {
                     MemoryCache.Builder(context.applicationContext)

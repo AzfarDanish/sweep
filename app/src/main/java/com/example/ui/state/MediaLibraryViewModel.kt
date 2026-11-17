@@ -22,6 +22,7 @@ import com.example.util.Formatters
 import com.example.util.PermissionHelper
 import kotlinx.coroutines.FlowPreview
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -105,9 +106,12 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
 
     private var activePendingOp: PendingIntentOperation? = null
     private var mediaScanJob: Job? = null
+    private var libraryReconcileJob: Job? = null
     private val viewerRemovedHistory = LinkedHashMap<Uri, Pair<Int, MediaItem>>()
     private val pendingViewerTrashUris = HashSet<Uri>()
     private val trashMutex = Mutex()
+    private var derivedLibraryContent: DerivedLibraryContent? = null
+    private var viewerSessionDirty = false
 
     private val baseFlow = combine(
         _permissionState,
@@ -130,22 +134,42 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
     }
 
     val uiState: StateFlow<MediaLibraryUiState> = combine(baseFlow, queryFlow) { base, q ->
-        val filtered = applyFilters(base.allMedia, base.filter, q.searchQuery)
-        val dateGroups = buildDateGroups(filtered)
-        val years = buildTimelineYears(base.allMedia)
-        val effectiveYear = q.selectedYear?.takeIf { target -> years.any { it.year == target } }
-            ?: years.firstOrNull()?.year
-        val albums = buildAlbums(base.allMedia)
+        // Trash/undo/selection changes fire frequently during rapid wiping. Keep the expensive
+        // grouping/album derivations tied to the media list itself so those updates are cheap.
+        val cached = derivedLibraryContent
+        val derived = if (
+            cached != null &&
+            cached.allMedia === base.allMedia &&
+            cached.filter == base.filter &&
+            cached.searchQuery == q.searchQuery
+        ) {
+            cached
+        } else {
+            val filtered = applyFilters(base.allMedia, base.filter, q.searchQuery)
+            DerivedLibraryContent(
+                allMedia = base.allMedia,
+                filter = base.filter,
+                searchQuery = q.searchQuery,
+                filtered = filtered,
+                dateGroups = buildDateGroups(filtered),
+                timelineYears = buildTimelineYears(base.allMedia),
+                albums = buildAlbums(base.allMedia),
+            ).also { derivedLibraryContent = it }
+        }
+
+        val effectiveYear = q.selectedYear?.takeIf { target ->
+            derived.timelineYears.any { it.year == target }
+        } ?: derived.timelineYears.firstOrNull()?.year
 
         MediaLibraryUiState(
             permissionState = base.permissionState,
             isLoading = base.isLoading,
             allMedia = base.allMedia,
-            filteredMedia = filtered,
-            dateGroups = dateGroups,
-            timelineYears = years,
+            filteredMedia = derived.filtered,
+            dateGroups = derived.dateGroups,
+            timelineYears = derived.timelineYears,
             selectedYear = effectiveYear,
-            albums = albums,
+            albums = derived.albums,
             trashedMedia = base.trashedMedia,
             filter = base.filter,
             searchQuery = q.searchQuery,
@@ -196,12 +220,71 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
     private fun loadMediaInternal(showSpinner: Boolean) {
         mediaScanJob?.cancel()
         mediaScanJob = viewModelScope.launch {
-            if (showSpinner) _isLoading.value = true
-            val scan = repository.scanAllMedia()
-            _allMedia.value = scan.activeMedia
-            _trashedMedia.value = scan.trashedMedia
-            _isLoading.value = false
+            // Serialize scans with media moves so a reconcile can never publish a snapshot that
+            // predates an in-flight swipe-to-trash operation.
+            trashMutex.withLock {
+                if (showSpinner) _isLoading.value = true
+                try {
+                    val scan = repository.scanAllMedia()
+                    // A scan can be granted the lock while a newer viewer trash is still queued
+                    // behind it. Keep those moves optimistic instead of publishing a snapshot that
+                    // briefly resurrects them in the gallery and removes them from the Trash Bin.
+                    val pendingUris = if (pendingViewerTrashUris.isEmpty()) {
+                        null
+                    } else {
+                        pendingViewerTrashUris.toHashSet()
+                    }
+                    if (pendingUris == null) {
+                        _allMedia.value = scan.activeMedia
+                        _trashedMedia.value = scan.trashedMedia
+                    } else {
+                        _allMedia.value = scan.activeMedia.filterNot {
+                            it.contentUri in pendingUris
+                        }
+                        val knownTrashed = scan.trashedMedia.mapTo(
+                            HashSet(scan.trashedMedia.size),
+                        ) { it.contentUri }
+                        val optimistic = pendingUris.mapNotNull { uri ->
+                            if (!knownTrashed.add(uri)) return@mapNotNull null
+                            viewerRemovedHistory[uri]?.second?.let {
+                                it.copy(isTrashed = true, isOsTrashed = false)
+                            }
+                        }
+                        _trashedMedia.value = if (optimistic.isEmpty()) {
+                            scan.trashedMedia
+                        } else {
+                            optimistic + scan.trashedMedia
+                        }
+                    }
+                } finally {
+                    _isLoading.value = false
+                }
+            }
         }
+    }
+
+    /**
+     * Coalesces post-trash library reconciliation into a single scan once rapid swiping pauses.
+     * The viewer list and Trash Bin are updated optimistically per swipe; the expensive MediaStore
+     * rescan must not run on every gesture.
+     */
+    private fun scheduleLibraryReconcile(delayMillis: Long = 450L) {
+        libraryReconcileJob?.cancel()
+        libraryReconcileJob = viewModelScope.launch {
+            if (delayMillis > 0L) {
+                delay(delayMillis)
+            }
+            loadMediaInternal(showSpinner = false)
+        }
+    }
+
+    /** Ensures the gallery reflects viewer trash actions as soon as the viewer is closed. */
+    fun refreshAfterViewerSession() {
+        libraryReconcileJob?.cancel()
+        libraryReconcileJob = null
+        if (!viewerSessionDirty) return
+        viewerSessionDirty = false
+        loadMediaInternal(showSpinner = false)
     }
 
     fun setFilter(filter: MediaFilter) {
@@ -237,6 +320,7 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
 
     fun openViewerSession(items: List<MediaItem>) {
         viewerRemovedHistory.clear()
+        viewerSessionDirty = false
         _viewerItems.value = items
     }
 
@@ -260,16 +344,36 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
         }
         if (targetUris.isEmpty()) return
 
+        val targetSet = targetUris.toSet()
         if (fromViewer) {
+            viewerSessionDirty = true
             val currentViewerList = _viewerItems.value
+            val removedItems = ArrayList<MediaItem>(targetUris.size)
             targetUris.forEach { uri ->
                 val idx = currentViewerList.indexOfFirst { it.contentUri == uri }
                 if (idx >= 0) {
                     viewerRemovedHistory[uri] = idx to currentViewerList[idx]
+                    removedItems.add(currentViewerList[idx])
                 }
             }
-            val targetSet = targetUris.toSet()
             _viewerItems.update { list -> list.filterNot { it.contentUri in targetSet } }
+
+            // Reflect the trashed items immediately so the viewer badge and Trash Bin stay in sync
+            // without waiting for a full MediaStore rescan.
+            if (removedItems.isNotEmpty()) {
+                _trashedMedia.update { current ->
+                    val knownUris = current.mapTo(HashSet(current.size)) { it.contentUri }
+                    val merged = ArrayList<MediaItem>(current.size + removedItems.size)
+                    removedItems.forEach { item ->
+                        if (knownUris.add(item.contentUri)) {
+                            merged.add(item.copy(isTrashed = true, isOsTrashed = false))
+                        }
+                    }
+                    merged.addAll(current)
+                    merged.sortByDescending { it.dateModifiedMillis }
+                    merged
+                }
+            }
             _selectedUris.value = emptySet()
         }
 
@@ -278,15 +382,36 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
                 try {
                     val moved = repository.moveToTrashImmediate(targetUris)
                     if (moved.isEmpty()) {
-                        loadMediaInternal(showSpinner = false)
+                        if (fromViewer) {
+                            _trashedMedia.update { list ->
+                                list.filterNot { it.contentUri in targetSet }
+                            }
+                            scheduleLibraryReconcile()
+                        } else {
+                            loadMediaInternal(showSpinner = false)
+                        }
                         return@launch
+                    }
+
+                    if (fromViewer && moved.size != targetUris.size) {
+                        val movedSet = moved.toSet()
+                        val failed = targetSet - movedSet
+                        if (failed.isNotEmpty()) {
+                            _trashedMedia.update { list ->
+                                list.filterNot { it.contentUri in failed }
+                            }
+                        }
                     }
 
                     undoRedoManager.recordNewAction(TrashAction.MoveToTrash(moved))
                     if (!fromViewer) {
                         _selectedUris.value = emptySet()
                     }
-                    loadMediaInternal(showSpinner = false)
+                    if (fromViewer) {
+                        scheduleLibraryReconcile()
+                    } else {
+                        loadMediaInternal(showSpinner = false)
+                    }
                 } finally {
                     if (fromViewer) {
                         pendingViewerTrashUris.removeAll(targetUris.toSet())
@@ -728,6 +853,16 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
 
         return collections + folderAlbums
     }
+
+    private data class DerivedLibraryContent(
+        val allMedia: List<MediaItem>,
+        val filter: MediaFilter,
+        val searchQuery: String,
+        val filtered: List<MediaItem>,
+        val dateGroups: List<MediaDateGroup>,
+        val timelineYears: List<TimelineYearGroup>,
+        val albums: List<AlbumCollection>,
+    )
 
     private data class BaseState(
         val permissionState: PermissionAccessState,

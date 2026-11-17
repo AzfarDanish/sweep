@@ -40,6 +40,7 @@ import com.example.ui.components.MediaInfoSheet
 import com.example.ui.components.PhysicsVerticalSwipeController
 import com.example.ui.components.VerticalSwipeDirection
 import com.example.ui.components.VerticalSwipePhase
+import com.example.ui.components.ViewerImageRequestParameter
 import com.example.ui.components.physicsVerticalSwipe
 import com.example.ui.components.rememberPhysicsVerticalSwipeConfig
 import com.example.ui.screens.MediaViewerScreen
@@ -49,12 +50,14 @@ import com.example.ui.screens.computeStackedUnderlyingCardTransform
 import com.example.ui.theme.SweepTheme
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import kotlin.math.abs
 
 @RunWith(RobolectricTestRunner::class)
 @Config(sdk = [36], qualifiers = "w411dp-h915dp-xxhdpi")
@@ -579,7 +582,11 @@ class PhysicsVerticalSwipeTest {
 
         // Decisive upward swipe dismisses once
         composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
-            swipeUp(startY = centerY, endY = top + 20f, durationMillis = 100L)
+            down(center)
+            repeat(5) {
+                moveBy(Offset(0f, -30f), delayMillis = 20L)
+            }
+            up()
         }
         composeTestRule.waitForIdle()
         assertEquals(1, trashed.size)
@@ -1208,16 +1215,21 @@ class PhysicsVerticalSwipeTest {
     }
 
     @Test
-    fun `22_layered_photo_presentation_renders_full_bounds_backdrop_and_centered_foreground_for_portrait_and_landscape`() {
-        val mixedItems = listOf(
+    fun `22_media_preview_tracks_each_natural_aspect_ratio_without_backdrop_or_reserved_space`() {
+        val aspectCases = listOf(
             sampleItems(1).first().copy(id = 10L, width = 900, height = 1600, displayName = "portrait.jpg"),
             sampleItems(1).first().copy(id = 20L, width = 1920, height = 1080, displayName = "landscape.jpg"),
+            sampleItems(1).first().copy(id = 30L, width = 1000, height = 1000, displayName = "square.jpg"),
+            sampleItems(1).first().copy(id = 40L, width = 2400, height = 400, displayName = "very-short.jpg"),
+            sampleItems(1).first().copy(id = 50L, width = 480, height = 2400, displayName = "very-tall.jpg"),
+            sampleItems(1).first().copy(id = 60L, width = 1800, height = 3200, displayName = "portrait-hi-res.jpg"),
+            sampleItems(1).first().copy(id = 70L, width = 3000, height = 2000, displayName = "wide.jpg"),
         )
         val trashed = mutableListOf<MediaItem>()
 
         composeTestRule.setContent {
             SweepTheme {
-                var items by remember { mutableStateOf(mixedItems) }
+                var items by remember { mutableStateOf(aspectCases) }
                 MediaViewerScreen(
                     items = items,
                     initialMediaId = 10L,
@@ -1239,39 +1251,99 @@ class PhysicsVerticalSwipeTest {
         }
 
         composeTestRule.waitForIdle()
+
+        val screenBounds = composeTestRule.onNodeWithTag("media_viewer_screen").getUnclippedBoundsInRoot()
         val viewportBounds = composeTestRule.onNodeWithTag("viewer_media_viewport").getUnclippedBoundsInRoot()
-        val portraitBackdrop = composeTestRule.onNodeWithTag("viewer_photo_backdrop_10").getUnclippedBoundsInRoot()
-        val portraitForeground = composeTestRule.onNodeWithTag("viewer_photo_foreground_10").getUnclippedBoundsInRoot()
+        // Header and bottom controls float above the media, so the viewport fills the whole screen.
+        assertEquals(screenBounds.left.value, viewportBounds.left.value, 0.5f)
+        assertEquals(screenBounds.top.value, viewportBounds.top.value, 0.5f)
+        assertEquals(screenBounds.right.value, viewportBounds.right.value, 0.5f)
+        assertEquals(screenBounds.bottom.value, viewportBounds.bottom.value, 0.5f)
 
-        assertEquals(viewportBounds.left.value, portraitBackdrop.left.value, 1f)
-        assertEquals(viewportBounds.top.value, portraitBackdrop.top.value, 1f)
-        assertEquals(viewportBounds.right.value, portraitBackdrop.right.value, 1f)
-        assertEquals(viewportBounds.bottom.value, portraitBackdrop.bottom.value, 1f)
-        assertEquals(viewportBounds.left.value, portraitForeground.left.value, 1f)
-        assertEquals(viewportBounds.top.value, portraitForeground.top.value, 1f)
-        assertEquals(viewportBounds.right.value, portraitForeground.right.value, 1f)
-        assertEquals(viewportBounds.bottom.value, portraitForeground.bottom.value, 1f)
+        val viewportWidth = (viewportBounds.right - viewportBounds.left).value
+        val viewportHeight = (viewportBounds.bottom - viewportBounds.top).value
+        val viewportCenterX = (viewportBounds.left.value + viewportBounds.right.value) / 2f
+        val viewportCenterY = (viewportBounds.top.value + viewportBounds.bottom.value) / 2f
 
-        // Underlying landscape item also stages layered backdrop + foreground
-        composeTestRule.onNodeWithTag("viewer_underlying_backdrop_20").assertExists()
-        composeTestRule.onNodeWithTag("viewer_underlying_foreground_20").assertExists()
-
-        // Swipe portrait item away -> landscape item becomes active with its layered backdrop + foreground
-        composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
-            swipeUp(startY = centerY, endY = top + 40f, durationMillis = 90L)
+        // Only the original media is rendered: no blurred backdrop, cover copy, or foreground layer.
+        composeTestRule.onNodeWithTag("viewer_underlying_media_card_20").assertExists()
+        listOf(
+            "viewer_photo_backdrop_10",
+            "viewer_photo_foreground_10",
+            "viewer_underlying_backdrop_20",
+            "viewer_underlying_foreground_20",
+        ).forEach { tag ->
+            composeTestRule.onNodeWithTag(tag).assertDoesNotExist()
         }
-        composeTestRule.waitForIdle()
 
-        val landscapeBackdrop = composeTestRule.onNodeWithTag("viewer_photo_backdrop_20").getUnclippedBoundsInRoot()
-        val landscapeForeground = composeTestRule.onNodeWithTag("viewer_photo_foreground_20").getUnclippedBoundsInRoot()
-        assertEquals(viewportBounds.left.value, landscapeBackdrop.left.value, 1f)
-        assertEquals(viewportBounds.top.value, landscapeBackdrop.top.value, 1f)
-        assertEquals(viewportBounds.right.value, landscapeBackdrop.right.value, 1f)
-        assertEquals(viewportBounds.bottom.value, landscapeBackdrop.bottom.value, 1f)
-        assertEquals(viewportBounds.left.value, landscapeForeground.left.value, 1f)
-        assertEquals(viewportBounds.top.value, landscapeForeground.top.value, 1f)
-        assertEquals(viewportBounds.right.value, landscapeForeground.right.value, 1f)
-        assertEquals(viewportBounds.bottom.value, landscapeForeground.bottom.value, 1f)
+        var firstPortraitSize: Pair<Float, Float>? = null
+        aspectCases.forEachIndexed { index, item ->
+            val expectedRatio = item.width.toFloat() / item.height.toFloat()
+            val card = composeTestRule.onNodeWithTag("viewer_media_card").getUnclippedBoundsInRoot()
+            val cardWidth = (card.right - card.left).value
+            val cardHeight = (card.bottom - card.top).value
+
+            assertEquals(
+                "Unexpected aspect ratio for ${item.displayName}",
+                expectedRatio,
+                cardWidth / cardHeight,
+                0.03f,
+            )
+            assertTrue(
+                "Card for ${item.displayName} exceeds viewport width: $cardWidth > $viewportWidth",
+                cardWidth <= viewportWidth + 1f,
+            )
+            assertTrue(
+                "Card for ${item.displayName} exceeds viewport height: $cardHeight > $viewportHeight",
+                cardHeight <= viewportHeight + 1f,
+            )
+            assertTrue(
+                "Card for ${item.displayName} should fill one viewport dimension",
+                abs(cardWidth - viewportWidth) <= 1f || abs(cardHeight - viewportHeight) <= 1f,
+            )
+            assertEquals(
+                "Card for ${item.displayName} is not horizontally centered",
+                viewportCenterX,
+                (card.left.value + card.right.value) / 2f,
+                1f,
+            )
+            assertEquals(
+                "Card for ${item.displayName} is not vertically centered",
+                viewportCenterY,
+                (card.top.value + card.bottom.value) / 2f,
+                1f,
+            )
+
+            composeTestRule.onNodeWithTag("viewer_photo_image_${item.id}").assertExists()
+            composeTestRule.onNodeWithTag("viewer_photo_backdrop_${item.id}").assertDoesNotExist()
+            composeTestRule.onNodeWithTag("viewer_photo_foreground_${item.id}").assertDoesNotExist()
+
+            if (item.id == 10L) {
+                firstPortraitSize = cardWidth to cardHeight
+            }
+            if (item.id == 60L) {
+                // Different resolution, same aspect ratio -> the same preview dimensions.
+                val portraitSize = requireNotNull(firstPortraitSize)
+                assertEquals(portraitSize.first, cardWidth, 1f)
+                assertEquals(portraitSize.second, cardHeight, 1f)
+            }
+
+            if (index < aspectCases.lastIndex) {
+                composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
+                    down(center)
+                    repeat(5) {
+                        moveBy(Offset(0f, -40f), delayMillis = 8L)
+                    }
+                    up()
+                }
+                composeTestRule.waitForIdle()
+
+                assertEquals(index + 1, trashed.size)
+                assertEquals(item.id, trashed.last().id)
+            }
+        }
+
+        assertEquals(aspectCases.dropLast(1).map { it.id }, trashed.map { it.id })
     }
 
     @Test
@@ -1284,18 +1356,33 @@ class PhysicsVerticalSwipeTest {
         val photoReqB = buildViewerImageRequest(context, photoItem)
         assertEquals(photoReqA.data, photoReqB.data)
         assertEquals(Precision.INEXACT, photoReqA.precision)
+        // The visible card and the prefetch must produce the same sharing key so the in-flight
+        // interceptor can deduplicate decodes instead of racing them.
+        val photoShareKey = photoReqA.parameters.value<String>(ViewerImageRequestParameter)
+        assertNotNull(photoShareKey)
+        assertEquals(
+            photoShareKey,
+            photoReqB.parameters.value<String>(ViewerImageRequestParameter),
+        )
+        // The sharing key must not leak into Coil's memory-cache extras.
+        assertFalse(
+            photoReqA.parameters.memoryCacheKeys().containsKey(ViewerImageRequestParameter),
+        )
 
         val videoReq = buildViewerImageRequest(context, videoItem)
         assertEquals(videoItem.contentUri, videoReq.data)
         assertEquals(Precision.INEXACT, videoReq.precision)
+        val videoShareKey = videoReq.parameters.value<String>(ViewerImageRequestParameter)
+        assertNotNull(videoShareKey)
+        assertTrue(videoShareKey != photoShareKey)
 
         val trashed = mutableListOf<MediaItem>()
         composeTestRule.setContent {
             SweepTheme {
-                var items by remember { mutableStateOf(sampleItems(2)) }
+                var items by remember { mutableStateOf(sampleItems(1)) }
                 MediaViewerScreen(
                     items = items,
-                    initialMediaId = 2L,
+                    initialMediaId = 1L,
                     isTrashPreview = false,
                     trashCount = trashed.size,
                     undoRedoState = UndoRedoUiState(),
@@ -1314,15 +1401,25 @@ class PhysicsVerticalSwipeTest {
         }
 
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithText("2 / 2").assertIsDisplayed()
+        composeTestRule.onNodeWithText("1 / 1").assertIsDisplayed()
+        composeTestRule.mainClock.autoAdvance = false
 
         composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
             swipeUp(startY = centerY, endY = top + 40f, durationMillis = 80L)
         }
+        // Trashing the only item empties the list immediately, but the outgoing card must still
+        // fly out instead of disappearing with the list branch.
+        composeTestRule.mainClock.advanceTimeBy(16L)
+
+        assertEquals(listOf(1L), trashed.map { it.id })
+        composeTestRule.onNodeWithTag("viewer_exiting_card_1").assertExists()
+        composeTestRule.onNodeWithText("No media remaining").assertIsDisplayed()
+
+        composeTestRule.mainClock.autoAdvance = true
         composeTestRule.waitForIdle()
 
-        assertEquals(listOf(2L), trashed.map { it.id })
-        composeTestRule.onNodeWithText("1 / 1").assertIsDisplayed()
-        composeTestRule.onNodeWithText("No media remaining").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("viewer_exiting_card_1").assertDoesNotExist()
+        composeTestRule.onNodeWithText("No media remaining").assertIsDisplayed()
+        assertEquals(listOf(1L), trashed.map { it.id })
     }
 }
