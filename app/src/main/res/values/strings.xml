@@ -40,4 +40,8 @@
     <string name="restored_from_trash">Restored from trash</string>
     <string name="add_folder">Add Folder</string>
     <string name="sort_by">Sort</string>
+    <string name="sort_oldest_first">Oldest first</string>
+    <string name="sort_newest_first">Newest first</string>
+    <string name="sort_largest_first">Largest first</string>
+    <string name="sort_smallest_first">Smallest first</string>
 </resources>

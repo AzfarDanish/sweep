@@ -456,10 +456,16 @@ fun SweepApp(
                     val album = remember(mediaUiState.albums, route.albumId) {
                         mediaUiState.albums.firstOrNull { it.id == route.albumId }
                     }
+                    val selectedSort = mediaUiState.albumSortOptions[route.albumId]
+                        ?: com.example.model.AlbumSortOption.OLDEST_FIRST
                     AlbumDetailScreen(
                         album = album,
                         selectedUris = mediaUiState.selectedUris,
                         gridColumns = gridColumns,
+                        selectedSort = selectedSort,
+                        onSortChange = { option ->
+                            mediaViewModel.setAlbumSortOption(route.albumId, option)
+                        },
                         onBack = {
                             mediaViewModel.clearSelection()
                             navController.popBackStack()

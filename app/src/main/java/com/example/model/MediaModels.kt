@@ -34,7 +34,11 @@ data class MediaItem(
     val isOsTrashed: Boolean = false,
 ) {
     val effectiveTimestampMillis: Long
-        get() = if (dateTakenMillis > 0L) dateTakenMillis else dateModifiedMillis
+        get() = when {
+            dateTakenMillis > 0L -> dateTakenMillis
+            dateModifiedMillis > 0L -> dateModifiedMillis
+            else -> 0L
+        }
 }
 
 data class MediaDateGroup(
@@ -89,6 +93,32 @@ enum class FileSortOption(val label: String) {
 enum class SortOrder {
     ASCENDING,
     DESCENDING,
+}
+
+enum class AlbumSortOption {
+    OLDEST_FIRST,
+    NEWEST_FIRST,
+    LARGEST_FIRST,
+    SMALLEST_FIRST,
+}
+
+fun sortAlbumMedia(items: List<MediaItem>, sortOption: AlbumSortOption): List<MediaItem> {
+    if (items.size <= 1) return items
+    val comparator = when (sortOption) {
+        AlbumSortOption.OLDEST_FIRST ->
+            compareBy<MediaItem> { it.effectiveTimestampMillis }.thenBy { it.id }
+        AlbumSortOption.NEWEST_FIRST ->
+            compareByDescending<MediaItem> { it.effectiveTimestampMillis }.thenByDescending { it.id }
+        AlbumSortOption.LARGEST_FIRST ->
+            compareByDescending<MediaItem> { it.sizeBytes.coerceAtLeast(0L) }
+                .thenBy { it.effectiveTimestampMillis }
+                .thenBy { it.id }
+        AlbumSortOption.SMALLEST_FIRST ->
+            compareBy<MediaItem> { it.sizeBytes.coerceAtLeast(0L) }
+                .thenBy { it.effectiveTimestampMillis }
+                .thenBy { it.id }
+    }
+    return items.sortedWith(comparator)
 }
 
 data class FileEntry(

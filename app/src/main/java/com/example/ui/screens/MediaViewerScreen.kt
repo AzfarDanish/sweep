@@ -154,6 +154,7 @@ import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.firstOrNull
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.hypot
 import kotlin.math.roundToInt
 
 private const val MaxExitingCards = 3
@@ -358,11 +359,14 @@ fun MediaViewerScreen(
     }
 
     val density = LocalDensity.current
+    var viewportWidthPx by remember { mutableFloatStateOf(1080f) }
     var viewportHeightPx by remember { mutableFloatStateOf(1600f) }
     var overlayCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
     var viewportCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
+    var trashIconCoords by remember { mutableStateOf<LayoutCoordinates?>(null) }
     var viewportOffsetInOverlay by remember { mutableStateOf(IntOffset.Zero) }
     var viewportSizeInOverlay by remember { mutableStateOf(IntSize.Zero) }
+    var trashCenterInViewport by remember { mutableStateOf<Offset?>(null) }
 
     fun syncViewportGeometry() {
         val overlay = overlayCoords?.takeIf { it.isAttached } ?: return
@@ -370,6 +374,16 @@ fun MediaViewerScreen(
         val topLeft = overlay.localPositionOf(viewport, Offset.Zero)
         viewportOffsetInOverlay = IntOffset(topLeft.x.roundToInt(), topLeft.y.roundToInt())
         viewportSizeInOverlay = viewport.size
+
+        val icon = trashIconCoords?.takeIf { it.isAttached }
+        if (icon != null) {
+            val iconCenter = Offset(icon.size.width * 0.5f, icon.size.height * 0.5f)
+            val iconCenterInOverlay = overlay.localPositionOf(icon, iconCenter)
+            trashCenterInViewport = Offset(
+                x = iconCenterInOverlay.x - topLeft.x,
+                y = iconCenterInOverlay.y - topLeft.y,
+            )
+        }
     }
 
     // Content-sized cards are centered, so any resting downward offset would let the staged next
@@ -388,14 +402,20 @@ fun MediaViewerScreen(
         verticalDirectionRatio = 1.3f,
         horizontalDirectionRatio = 1.3f,
     )
-    // Ensure the exit/return trajectory always clears both the top header and safe-drawing top
-    // inset so cards exit and re-enter completely past the top edge of the screen.
-    val topClearancePx = viewportOffsetInOverlay.y.toFloat().coerceAtLeast(0f)
-    val extraExitBufferPx = with(density) { 48.dp.toPx() }
-    val exitTargetOffsetY = -maxOf(
-        trashConfig.dismissTargetOffsetPx,
-        viewportHeightPx + topClearancePx + extraExitBufferPx,
+    val fallbackTrashTargetInViewport = Offset(
+        x = viewportWidthPx - with(density) { 28.dp.toPx() },
+        y = -with(density) { 28.dp.toPx() },
     )
+    val resolvedTrashTargetInViewport = trashCenterInViewport ?: fallbackTrashTargetInViewport
+
+    val resolveCardHeightPx: (MediaItem) -> Float = { item ->
+        val ratio = resolvedRatios[item.id] ?: item.viewerAspectRatio()
+        resolveViewerCardSizePx(
+            viewportWidthPx = viewportWidthPx,
+            viewportHeightPx = viewportHeightPx,
+            aspectRatio = ratio,
+        ).second.coerceAtLeast(1f)
+    }
 
     // Keep one stable controller & pointer-input session across rapid card transitions.
     val trashSwipeController = remember {
@@ -423,20 +443,29 @@ fun MediaViewerScreen(
         trashSwipeController.snapToRestSync(VerticalSwipePhase.Idle)
 
         val inFlightExit = exitingCards.firstOrNull { it.item.id == targetItem.id }
-        val startOffsetY = if (inFlightExit != null) {
-            val captured = inFlightExit.offsetYState.floatValue
+        val startProgress = if (inFlightExit != null) {
+            val captured = inFlightExit.progressState.floatValue
             exitingCards.remove(inFlightExit)
-            captured.coerceAtMost(-1f)
+            captured.coerceIn(0.02f, 1f)
         } else {
-            exitTargetOffsetY
+            1f
         }
+        val vw = inFlightExit?.viewportWidthPx ?: viewportWidthPx
+        val vh = inFlightExit?.viewportHeightPx ?: viewportHeightPx
+        val cardHeight = inFlightExit?.cardHeightPx ?: resolveCardHeightPx(targetItem)
+        val trashTarget = inFlightExit?.trashBinCenterInViewport ?: resolvedTrashTargetInViewport
 
         activeUndoReturn = UndoReturningCardState(
             instanceId = ++undoIdCounter.value,
             item = targetItem,
             targetPage = targetIndex,
-            offsetYState = mutableFloatStateOf(startOffsetY),
-            startOffsetY = startOffsetY,
+            progressState = mutableFloatStateOf(startProgress),
+            startProgress = startProgress,
+            revealProgressState = mutableFloatStateOf((startProgress * 1.45f).coerceIn(0f, 1f)),
+            viewportWidthPx = vw,
+            viewportHeightPx = vh,
+            cardHeightPx = cardHeight,
+            trashBinCenterInViewport = trashTarget,
             dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
         )
     }
@@ -533,9 +562,13 @@ fun MediaViewerScreen(
             val exitCard = ExitingCardState(
                 instanceId = ++exitIdCounter.value,
                 item = targetItem,
-                offsetYState = mutableFloatStateOf(releasedOffsetY),
-                targetOffsetY = exitTargetOffsetY,
-                initialVelocityY = releasedVelocityY,
+                progressState = mutableFloatStateOf(0f),
+                startOffsetY = releasedOffsetY,
+                startVelocityY = releasedVelocityY,
+                viewportWidthPx = viewportWidthPx,
+                viewportHeightPx = viewportHeightPx,
+                cardHeightPx = resolveCardHeightPx(targetItem),
+                trashBinCenterInViewport = resolvedTrashTargetInViewport,
                 dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
             )
             exitingCards.add(exitCard)
@@ -600,8 +633,7 @@ fun MediaViewerScreen(
         null
     }
     val hiddenForUndoItemId = activeUndoReturn?.item?.id ?: pendingRestoredItemId
-    val fullExitOffsetState = remember { mutableFloatStateOf(exitTargetOffsetY) }
-    fullExitOffsetState.floatValue = exitTargetOffsetY
+    val fullRevealState = remember { mutableFloatStateOf(1f) }
 
     Box(
         modifier = Modifier
@@ -621,6 +653,10 @@ fun MediaViewerScreen(
                 trashCount = trashCount,
                 onBack = onBack,
                 onOpenTrash = onOpenTrash,
+                onTrashIconPositioned = { coords ->
+                    trashIconCoords = coords
+                    syncViewportGeometry()
+                },
                 modifier = Modifier.zIndex(0f),
             )
 
@@ -634,6 +670,7 @@ fun MediaViewerScreen(
                     .weight(1f)
                     .zIndex(1f)
                     .onSizeChanged { size ->
+                        if (size.width > 0) viewportWidthPx = size.width.toFloat()
                         if (size.height > 0) viewportHeightPx = size.height.toFloat()
                     }
                     .onGloballyPositioned { coords ->
@@ -669,18 +706,19 @@ fun MediaViewerScreen(
                     if (nextItem != null) {
                         val undoActiveForCurrent =
                             hiddenForUndoItemId != null && currentItem.id == hiddenForUndoItemId
-                        val underlyingOffsetY = when {
+                        val underlyingRevealOverride = when {
                             activeUndoReturn != null && activeUndoReturn?.item?.id == currentItem.id ->
-                                activeUndoReturn!!.offsetYState
-                            undoActiveForCurrent -> fullExitOffsetState
-                            else -> trashSwipeController.offsetY
+                                activeUndoReturn!!.revealProgressState
+                            undoActiveForCurrent -> fullRevealState
+                            else -> null
                         }
                         StackedUnderlyingCard(
                             item = nextItem,
                             imageLoader = imageLoader,
                             resolvedRatios = resolvedRatios,
-                            offsetY = underlyingOffsetY,
+                            offsetY = trashSwipeController.offsetY,
                             dismissDistanceThresholdPx = trashConfig.dismissDistanceThresholdPx,
+                            revealProgressOverride = underlyingRevealOverride,
                             modifier = Modifier
                                 .fillMaxSize()
                                 .zIndex(0f),
@@ -716,7 +754,8 @@ fun MediaViewerScreen(
                                 val currentOffsetY = trashSwipeController.offsetY.floatValue
                                 val dismissThreshold =
                                     trashConfig.dismissDistanceThresholdPx.coerceAtLeast(1f)
-                                val dismissTarget = (-exitTargetOffsetY).coerceAtLeast(1f)
+                                val dismissTarget =
+                                    trashConfig.dismissTargetOffsetPx.coerceAtLeast(1f)
                                 val liftProgress =
                                     (-currentOffsetY / dismissThreshold).coerceIn(0f, 1f)
                                 val exitProgress =
@@ -921,6 +960,7 @@ private fun ViewerTopHeader(
     trashCount: Int,
     onBack: () -> Unit,
     onOpenTrash: () -> Unit,
+    onTrashIconPositioned: (LayoutCoordinates) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     val iconScale = remember { Animatable(1f) }
@@ -1027,9 +1067,9 @@ private fun ViewerTopHeader(
                 .minimumInteractiveComponentSize()
                 .testTag("viewer_trash_button"),
         ) {
-            if (trashCount > 0) {
-                BadgedBox(
-                    badge = {
+            BadgedBox(
+                badge = {
+                    if (trashCount > 0) {
                         Badge(
                             containerColor = SweepBadgeRed,
                             contentColor = SweepBadgeWhite,
@@ -1048,27 +1088,19 @@ private fun ViewerTopHeader(
                                 ),
                             )
                         }
-                    },
-                ) {
-                    Icon(
-                        imageVector = Icons.Outlined.DeleteOutline,
-                        contentDescription = stringResource(R.string.trash_bin_count_cd, trashCount),
-                        tint = Color.White,
-                        modifier = Modifier
-                            .graphicsLayer {
-                                val s = iconScale.value
-                                scaleX = s
-                                scaleY = s
-                            }
-                            .testTag("viewer_trash_icon"),
-                    )
-                }
-            } else {
+                    }
+                },
+            ) {
                 Icon(
                     imageVector = Icons.Outlined.DeleteOutline,
-                    contentDescription = stringResource(R.string.trash_bin_empty_cd),
-                    tint = Color.White.copy(alpha = 0.72f),
+                    contentDescription = if (trashCount > 0) {
+                        stringResource(R.string.trash_bin_count_cd, trashCount)
+                    } else {
+                        stringResource(R.string.trash_bin_empty_cd)
+                    },
+                    tint = if (trashCount > 0) Color.White else Color.White.copy(alpha = 0.72f),
                     modifier = Modifier
+                        .onGloballyPositioned(onTrashIconPositioned)
                         .graphicsLayer {
                             val s = iconScale.value
                             scaleX = s
@@ -1476,9 +1508,13 @@ internal fun buildViewerImageRequest(
 private data class ExitingCardState(
     val instanceId: Long,
     val item: MediaItem,
-    val offsetYState: MutableFloatState,
-    val targetOffsetY: Float,
-    val initialVelocityY: Float,
+    val progressState: MutableFloatState,
+    val startOffsetY: Float,
+    val startVelocityY: Float,
+    val viewportWidthPx: Float,
+    val viewportHeightPx: Float,
+    val cardHeightPx: Float,
+    val trashBinCenterInViewport: Offset,
     val dismissDistanceThresholdPx: Float,
 )
 
@@ -1486,8 +1522,13 @@ private data class UndoReturningCardState(
     val instanceId: Long,
     val item: MediaItem,
     val targetPage: Int,
-    val offsetYState: MutableFloatState,
-    val startOffsetY: Float,
+    val progressState: MutableFloatState,
+    val startProgress: Float,
+    val revealProgressState: MutableFloatState,
+    val viewportWidthPx: Float,
+    val viewportHeightPx: Float,
+    val cardHeightPx: Float,
+    val trashBinCenterInViewport: Offset,
     val dismissDistanceThresholdPx: Float,
 )
 
@@ -1527,18 +1568,27 @@ private fun ExitingCardOverlay(
     onFinished: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val density = LocalDensity.current
-
     LaunchedEffect(exitCard.instanceId) {
+        val verticalTravel = (
+            (exitCard.viewportHeightPx * 0.5f + exitCard.startOffsetY - exitCard.cardHeightPx * 0.5f) -
+                exitCard.trashBinCenterInViewport.y
+            ).coerceAtLeast(180f)
+        val distanceEstimate = hypot(
+            (exitCard.trashBinCenterInViewport.x - exitCard.viewportWidthPx * 0.5f).toDouble(),
+            verticalTravel.toDouble(),
+        ).toFloat().coerceAtLeast(240f)
+        val initialVelocityProgress =
+            (-exitCard.startVelocityY / distanceEstimate).coerceIn(0.6f, 6.5f)
+
         val anim = TargetBasedAnimation(
             animationSpec = spring(
-                dampingRatio = dismissDampingRatio,
-                stiffness = dismissStiffness,
+                dampingRatio = maxOf(dismissDampingRatio, Spring.DampingRatioNoBouncy),
+                stiffness = maxOf(dismissStiffness, Spring.StiffnessMedium),
             ),
             typeConverter = Float.VectorConverter,
-            initialValue = exitCard.offsetYState.floatValue,
-            targetValue = exitCard.targetOffsetY,
-            initialVelocity = exitCard.initialVelocityY,
+            initialValue = 0f,
+            targetValue = 1f,
+            initialVelocity = initialVelocityProgress,
         )
         var startNanos = Long.MIN_VALUE
         try {
@@ -1549,10 +1599,10 @@ private fun ExitingCardOverlay(
                 }
                 val playNanos = frameNanos - startNanos
                 if (anim.isFinishedFromNanos(playNanos)) {
-                    exitCard.offsetYState.floatValue = exitCard.targetOffsetY
+                    exitCard.progressState.floatValue = 1f
                     break
                 }
-                exitCard.offsetYState.floatValue = anim.getValueFromNanos(playNanos)
+                exitCard.progressState.floatValue = anim.getValueFromNanos(playNanos).coerceIn(0f, 1f)
             }
         } finally {
             onFinished()
@@ -1563,19 +1613,31 @@ private fun ExitingCardOverlay(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .graphicsLayer {
-                val offsetY = exitCard.offsetYState.floatValue
-                val dismissThreshold =
-                    exitCard.dismissDistanceThresholdPx.coerceAtLeast(1f)
-                val dismissTarget = (-exitCard.targetOffsetY).coerceAtLeast(1f)
-                val liftProgress = (-offsetY / dismissThreshold).coerceIn(0f, 1f)
-                val exitProgress = (-offsetY / dismissTarget).coerceIn(0f, 1f)
+                val liveRatio = resolvedRatios[exitCard.item.id] ?: exitCard.item.viewerAspectRatio()
+                val liveCardHeight = resolveViewerCardSizePx(
+                    viewportWidthPx = exitCard.viewportWidthPx,
+                    viewportHeightPx = exitCard.viewportHeightPx,
+                    aspectRatio = liveRatio,
+                ).second.takeIf { it > 0f } ?: exitCard.cardHeightPx
 
-                translationY = offsetY
-                val scale = 1f - (liftProgress * 0.08f) - (exitProgress * 0.06f)
-                scaleX = scale
-                scaleY = scale
-                rotationZ = (liftProgress * 1.8f + exitProgress * 0.7f).coerceIn(0f, 4f)
-                cameraDistance = 16f * density.density
+                val transform = computeTrashBinTrajectoryTransform(
+                    progress = exitCard.progressState.floatValue,
+                    viewportWidthPx = exitCard.viewportWidthPx,
+                    viewportHeightPx = exitCard.viewportHeightPx,
+                    cardHeightPx = liveCardHeight,
+                    trashBinCenterInViewport = exitCard.trashBinCenterInViewport,
+                    startOffsetY = exitCard.startOffsetY,
+                    dismissDistanceThresholdPx = exitCard.dismissDistanceThresholdPx,
+                    startVelocityY = exitCard.startVelocityY,
+                )
+
+                translationX = transform.translationX
+                translationY = transform.translationY
+                scaleX = transform.scale
+                scaleY = transform.scale
+                rotationZ = transform.rotationZ
+                alpha = transform.alpha
+                cameraDistance = 16f * this.density
             }
             .testTag("viewer_exiting_card_${exitCard.item.id}"),
     ) {
@@ -1599,18 +1661,16 @@ private fun UndoReturningCardOverlay(
     onFinished: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val density = LocalDensity.current
-
     LaunchedEffect(returningCard.instanceId) {
         val anim = TargetBasedAnimation(
             animationSpec = spring(
-                dampingRatio = settleDampingRatio,
+                dampingRatio = maxOf(settleDampingRatio, Spring.DampingRatioNoBouncy),
                 stiffness = settleStiffness,
             ),
             typeConverter = Float.VectorConverter,
-            initialValue = returningCard.offsetYState.floatValue,
+            initialValue = returningCard.startProgress,
             targetValue = 0f,
-            initialVelocity = 0f,
+            initialVelocity = -1.2f,
         )
         var startNanos = Long.MIN_VALUE
         try {
@@ -1621,10 +1681,13 @@ private fun UndoReturningCardOverlay(
                 }
                 val playNanos = frameNanos - startNanos
                 if (anim.isFinishedFromNanos(playNanos)) {
-                    returningCard.offsetYState.floatValue = 0f
+                    returningCard.progressState.floatValue = 0f
+                    returningCard.revealProgressState.floatValue = 0f
                     break
                 }
-                returningCard.offsetYState.floatValue = anim.getValueFromNanos(playNanos)
+                val p = anim.getValueFromNanos(playNanos).coerceIn(0f, 1f)
+                returningCard.progressState.floatValue = p
+                returningCard.revealProgressState.floatValue = (p * 1.45f).coerceIn(0f, 1f)
             }
         } finally {
             Snapshot.withMutableSnapshot {
@@ -1637,19 +1700,31 @@ private fun UndoReturningCardOverlay(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .graphicsLayer {
-                val offsetY = returningCard.offsetYState.floatValue
-                val dismissThreshold =
-                    returningCard.dismissDistanceThresholdPx.coerceAtLeast(1f)
-                val dismissTarget = (-returningCard.startOffsetY).coerceAtLeast(1f)
-                val liftProgress = (-offsetY / dismissThreshold).coerceIn(0f, 1f)
-                val exitProgress = (-offsetY / dismissTarget).coerceIn(0f, 1f)
+                val liveRatio =
+                    resolvedRatios[returningCard.item.id] ?: returningCard.item.viewerAspectRatio()
+                val liveCardHeight = resolveViewerCardSizePx(
+                    viewportWidthPx = returningCard.viewportWidthPx,
+                    viewportHeightPx = returningCard.viewportHeightPx,
+                    aspectRatio = liveRatio,
+                ).second.takeIf { it > 0f } ?: returningCard.cardHeightPx
 
-                translationY = offsetY
-                val scale = 1f - (liftProgress * 0.08f) - (exitProgress * 0.06f)
-                scaleX = scale
-                scaleY = scale
-                rotationZ = (liftProgress * 1.8f + exitProgress * 0.7f).coerceIn(0f, 4f)
-                cameraDistance = 16f * density.density
+                val transform = computeTrashBinTrajectoryTransform(
+                    progress = returningCard.progressState.floatValue,
+                    viewportWidthPx = returningCard.viewportWidthPx,
+                    viewportHeightPx = returningCard.viewportHeightPx,
+                    cardHeightPx = liveCardHeight,
+                    trashBinCenterInViewport = returningCard.trashBinCenterInViewport,
+                    startOffsetY = 0f,
+                    dismissDistanceThresholdPx = returningCard.dismissDistanceThresholdPx,
+                )
+
+                translationX = transform.translationX
+                translationY = transform.translationY
+                scaleX = transform.scale
+                scaleY = transform.scale
+                rotationZ = transform.rotationZ
+                alpha = transform.alpha
+                cameraDistance = 16f * this.density
             }
             .testTag("viewer_undo_returning_card_${returningCard.item.id}"),
     ) {
@@ -1670,6 +1745,7 @@ private fun StackedUnderlyingCard(
     resolvedRatios: MutableMap<Long, Float>,
     offsetY: FloatState,
     dismissDistanceThresholdPx: Float,
+    revealProgressOverride: FloatState? = null,
     modifier: Modifier = Modifier,
 ) {
     val restingOffsetPx = 0f
@@ -1679,7 +1755,8 @@ private fun StackedUnderlyingCard(
         contentAlignment = Alignment.Center,
         modifier = modifier
             .graphicsLayer {
-                val revealProgress = (-offsetY.floatValue / revealDistancePx).coerceIn(0f, 1f)
+                val revealProgress = revealProgressOverride?.floatValue?.coerceIn(0f, 1f)
+                    ?: (-offsetY.floatValue / revealDistancePx).coerceIn(0f, 1f)
                 val scale = 0.92f + (0.08f * revealProgress)
                 scaleX = scale
                 scaleY = scale
@@ -1701,7 +1778,8 @@ private fun StackedUnderlyingCard(
             modifier = Modifier
                 .fillMaxSize()
                 .graphicsLayer {
-                    val revealProgress = (-offsetY.floatValue / revealDistancePx).coerceIn(0f, 1f)
+                    val revealProgress = revealProgressOverride?.floatValue?.coerceIn(0f, 1f)
+                        ?: (-offsetY.floatValue / revealDistancePx).coerceIn(0f, 1f)
                     alpha = 0.45f * (1f - revealProgress)
                 }
                 .background(Color.Black)

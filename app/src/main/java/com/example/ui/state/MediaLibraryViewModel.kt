@@ -11,6 +11,7 @@ import com.example.data.UndoRedoManager
 import com.example.data.UndoRedoUiState
 import com.example.model.AlbumCollection
 import com.example.model.AlbumKind
+import com.example.model.AlbumSortOption
 import com.example.model.MediaDateGroup
 import com.example.model.MediaFilter
 import com.example.model.MediaItem
@@ -18,6 +19,7 @@ import com.example.model.PermissionAccessState
 import com.example.model.TimelineMonthGroup
 import com.example.model.TimelineYearGroup
 import com.example.model.TrashAction
+import com.example.model.sortAlbumMedia
 import com.example.util.Formatters
 import com.example.util.PermissionHelper
 import kotlinx.coroutines.FlowPreview
@@ -78,6 +80,7 @@ data class MediaLibraryUiState(
     val isSearchActive: Boolean = false,
     val selectedUris: Set<Uri> = emptySet(),
     val undoRedoState: UndoRedoUiState = UndoRedoUiState(),
+    val albumSortOptions: Map<String, AlbumSortOption> = emptyMap(),
 )
 
 @OptIn(FlowPreview::class)
@@ -94,6 +97,7 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
     private val _isSearchActive = MutableStateFlow(false)
     private val _selectedUris = MutableStateFlow<Set<Uri>>(emptySet())
     private val _selectedYear = MutableStateFlow<Int?>(null)
+    private val _albumSortOptions = MutableStateFlow<Map<String, AlbumSortOption>>(emptyMap())
 
     private val _viewerItems = MutableStateFlow<List<MediaItem>>(emptyList())
     val viewerItems: StateFlow<List<MediaItem>> = _viewerItems.asStateFlow()
@@ -136,27 +140,43 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
         QueryState(query, searchActive, selected, year, undoState)
     }
 
-    val uiState: StateFlow<MediaLibraryUiState> = combine(baseFlow, queryFlow) { base, q ->
-        // Trash/undo/selection changes fire frequently during rapid wiping. Keep the expensive
-        // grouping/album derivations tied to the media list itself so those updates are cheap.
+    val uiState: StateFlow<MediaLibraryUiState> = combine(
+        baseFlow,
+        queryFlow,
+        _albumSortOptions,
+    ) { base, q, albumSorts ->
+        // Trash/undo/selection/sort changes fire independently of library scans. Keep cached
+        // filter/timeline/album derivations scoped to what actually changed.
         val cached = derivedLibraryContent
         val derived = if (
             cached != null &&
             cached.allMedia === base.allMedia &&
             cached.filter == base.filter &&
-            cached.searchQuery == q.searchQuery
+            cached.searchQuery == q.searchQuery &&
+            cached.albumSortOptions == albumSorts
         ) {
             cached
+        } else if (
+            cached != null &&
+            cached.allMedia === base.allMedia &&
+            cached.filter == base.filter &&
+            cached.searchQuery == q.searchQuery
+        ) {
+            cached.copy(
+                albumSortOptions = albumSorts,
+                albums = buildAlbums(base.allMedia, albumSorts),
+            ).also { derivedLibraryContent = it }
         } else {
             val filtered = applyFilters(base.allMedia, base.filter, q.searchQuery)
             DerivedLibraryContent(
                 allMedia = base.allMedia,
                 filter = base.filter,
                 searchQuery = q.searchQuery,
+                albumSortOptions = albumSorts,
                 filtered = filtered,
                 dateGroups = buildDateGroups(filtered),
                 timelineYears = buildTimelineYears(base.allMedia),
-                albums = buildAlbums(base.allMedia),
+                albums = buildAlbums(base.allMedia, albumSorts),
             ).also { derivedLibraryContent = it }
         }
 
@@ -179,6 +199,7 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
             isSearchActive = q.isSearchActive,
             selectedUris = q.selectedUris,
             undoRedoState = q.undoState,
+            albumSortOptions = albumSorts,
         )
     }.stateIn(
         scope = viewModelScope,
@@ -334,8 +355,15 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    fun setAlbumSortOption(albumId: String, sortOption: AlbumSortOption) {
+        _albumSortOptions.update { current ->
+            if (current[albumId] == sortOption) current else current + (albumId to sortOption)
+        }
+    }
+
     fun getAlbumById(albumId: String): AlbumCollection? {
-        return buildAlbums(_allMedia.value).firstOrNull { it.id == albumId }
+        return buildAlbums(_allMedia.value, _albumSortOptions.value)
+            .firstOrNull { it.id == albumId }
     }
 
     fun requestTrash(uris: List<Uri>, fromViewer: Boolean = false) {
@@ -869,38 +897,47 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
             }
     }
 
-    private fun buildAlbums(items: List<MediaItem>): List<AlbumCollection> {
+    private fun buildAlbums(
+        items: List<MediaItem>,
+        albumSortOptions: Map<String, AlbumSortOption> = emptyMap(),
+    ): List<AlbumCollection> {
         if (items.isEmpty()) return emptyList()
         val collections = mutableListOf<AlbumCollection>()
 
         val photos = items.filter { !it.isVideo }
         if (photos.isNotEmpty()) {
+            val albumId = "logical_photos"
+            val sortOption = albumSortOptions[albumId] ?: AlbumSortOption.OLDEST_FIRST
+            val sortedPhotos = sortAlbumMedia(photos, sortOption)
             collections.add(
                 AlbumCollection(
-                    id = "logical_photos",
+                    id = albumId,
                     name = "All Photos",
                     kind = AlbumKind.LOGICAL,
                     coverUri = photos.first().contentUri,
                     coverIsVideo = false,
-                    count = photos.size,
+                    count = sortedPhotos.size,
                     subtitle = "Logical collection",
-                    items = photos,
+                    items = sortedPhotos,
                 ),
             )
         }
 
         val videos = items.filter { it.isVideo }
         if (videos.isNotEmpty()) {
+            val albumId = "logical_videos"
+            val sortOption = albumSortOptions[albumId] ?: AlbumSortOption.OLDEST_FIRST
+            val sortedVideos = sortAlbumMedia(videos, sortOption)
             collections.add(
                 AlbumCollection(
-                    id = "logical_videos",
+                    id = albumId,
                     name = "All Videos",
                     kind = AlbumKind.LOGICAL,
                     coverUri = videos.first().contentUri,
                     coverIsVideo = true,
-                    count = videos.size,
+                    count = sortedVideos.size,
                     subtitle = "Logical collection",
-                    items = videos,
+                    items = sortedVideos,
                 ),
             )
         }
@@ -911,15 +948,18 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
             .filter { it.isNotEmpty() }
             .map { bucketItems ->
                 val first = bucketItems.first()
+                val albumId = "bucket_${first.bucketId}"
+                val sortOption = albumSortOptions[albumId] ?: AlbumSortOption.OLDEST_FIRST
+                val sortedBucketItems = sortAlbumMedia(bucketItems, sortOption)
                 AlbumCollection(
-                    id = "bucket_${first.bucketId}",
+                    id = albumId,
                     name = first.bucketName,
                     kind = AlbumKind.FOLDER,
                     coverUri = first.contentUri,
                     coverIsVideo = first.isVideo,
-                    count = bucketItems.size,
+                    count = sortedBucketItems.size,
                     subtitle = first.relativePath.trimEnd('/').ifBlank { "Device folder" },
-                    items = bucketItems,
+                    items = sortedBucketItems,
                 )
             }
             .sortedByDescending { it.count }
@@ -931,6 +971,7 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
         val allMedia: List<MediaItem>,
         val filter: MediaFilter,
         val searchQuery: String,
+        val albumSortOptions: Map<String, AlbumSortOption>,
         val filtered: List<MediaItem>,
         val dateGroups: List<MediaDateGroup>,
         val timelineYears: List<TimelineYearGroup>,

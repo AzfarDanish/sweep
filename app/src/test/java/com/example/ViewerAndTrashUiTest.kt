@@ -131,6 +131,12 @@ class ViewerAndTrashUiTest {
         val viewportInitial =
             composeTestRule.onNodeWithTag("viewer_media_viewport").fetchSemanticsNode().boundsInRoot
 
+        val trashIconCenterInitial = composeTestRule
+            .onNodeWithTag("viewer_trash_icon", useUnmergedTree = true)
+            .fetchSemanticsNode()
+            .boundsInRoot
+            .center
+
         composeTestRule.mainClock.autoAdvance = false
         composeTestRule.onNodeWithTag("viewer_media_card").performTouchInput {
             swipeUp(
@@ -142,22 +148,42 @@ class ViewerAndTrashUiTest {
         composeTestRule.mainClock.advanceTimeBy(16L)
 
         assertEquals(listOf(1L), trashed.map { it.id })
-        composeTestRule.onNodeWithTag("viewer_exiting_card_1").assertExists()
+        composeTestRule.onNodeWithTag("viewer_exiting_media_card_1").assertExists()
 
         var observedOverHeader = false
-        var observedPastTopEdge = false
-        repeat(24) {
+        var prevTopCenter: Offset? = null
+        var firstDistanceToTrash = Float.MAX_VALUE
+        var minDistanceToTrash = Float.MAX_VALUE
+        var maxStepJump = 0f
+
+        repeat(28) {
             val exitingNodes = composeTestRule
-                .onAllNodes(androidx.compose.ui.test.hasTestTag("viewer_exiting_card_1"))
+                .onAllNodes(androidx.compose.ui.test.hasTestTag("viewer_exiting_media_card_1"))
                 .fetchSemanticsNodes()
             if (exitingNodes.isNotEmpty()) {
                 val bounds = exitingNodes.first().boundsInRoot
+                val topCenter = Offset((bounds.left + bounds.right) * 0.5f, bounds.top)
                 if (bounds.top < viewportInitial.top && bounds.top < topHeaderInitial.bottom) {
                     observedOverHeader = true
                 }
-                if (bounds.top < topHeaderInitial.top) {
-                    observedPastTopEdge = true
+                val dist = kotlin.math.hypot(
+                    (topCenter.x - trashIconCenterInitial.x).toDouble(),
+                    (topCenter.y - trashIconCenterInitial.y).toDouble(),
+                ).toFloat()
+                if (firstDistanceToTrash == Float.MAX_VALUE) {
+                    firstDistanceToTrash = dist
                 }
+                if (dist < minDistanceToTrash) {
+                    minDistanceToTrash = dist
+                }
+                prevTopCenter?.let { prev ->
+                    val step = kotlin.math.hypot(
+                        (topCenter.x - prev.x).toDouble(),
+                        (topCenter.y - prev.y).toDouble(),
+                    ).toFloat()
+                    if (step > maxStepJump) maxStepJump = step
+                }
+                prevTopCenter = topCenter
             }
             val headerNow =
                 composeTestRule.onNodeWithTag("viewer_top_header").fetchSemanticsNode().boundsInRoot
@@ -167,11 +193,16 @@ class ViewerAndTrashUiTest {
         }
 
         assertTrue("Exiting card must pass unclipped over viewer_top_header", observedOverHeader)
-        assertTrue("Exiting card must travel beyond the top header edge", observedPastTopEdge)
+        assertTrue(
+            "Top-center must converge toward Trash Bin icon (start=$firstDistanceToTrash, min=$minDistanceToTrash)",
+            minDistanceToTrash < firstDistanceToTrash * 0.25f && minDistanceToTrash < 48f,
+        )
+        assertTrue("Trajectory must be smooth without abrupt jumps (maxStep=$maxStepJump)", maxStepJump < 220f)
 
         composeTestRule.mainClock.autoAdvance = true
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("viewer_exiting_card_1").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("viewer_trash_badge", useUnmergedTree = true).assertExists()
     }
 
     @Test
