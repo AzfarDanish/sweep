@@ -96,8 +96,8 @@ enum class SortOrder {
 }
 
 enum class AlbumSortOption {
-    OLDEST_FIRST,
     NEWEST_FIRST,
+    OLDEST_FIRST,
     LARGEST_FIRST,
     SMALLEST_FIRST,
 }

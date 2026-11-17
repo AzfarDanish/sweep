@@ -11,6 +11,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -24,13 +25,18 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.unit.dp
+import com.example.model.AlbumSortOption
 import com.example.model.MediaItem
+import com.example.model.sortAlbumMedia
 import com.example.ui.components.MediaThumbnailTile
 import com.example.ui.components.SelectionTopBar
+import com.example.ui.components.SortMenuButton
+import com.example.ui.components.dragSelectGrid
 import com.example.ui.components.rememberSweepImageLoader
 import com.example.util.Formatters
 
@@ -42,15 +48,31 @@ fun MonthDetailScreen(
     items: List<MediaItem>,
     selectedUris: Set<Uri>,
     gridColumns: Int,
+    selectedSort: AlbumSortOption = AlbumSortOption.NEWEST_FIRST,
+    onSortChange: (AlbumSortOption) -> Unit = {},
     onBack: () -> Unit,
     onOpenViewer: (List<MediaItem>, MediaItem) -> Unit,
     onToggleSelection: (Uri) -> Unit,
     onSelectAll: (List<Uri>) -> Unit,
     onClearSelection: () -> Unit,
     onTrashSelected: () -> Unit,
+    onSelectUris: (List<Uri>) -> Unit = { uris ->
+        uris.forEach { uri ->
+            if (uri !in selectedUris) onToggleSelection(uri)
+        }
+    },
 ) {
     val isSelectionMode = selectedUris.isNotEmpty()
     val imageLoader = rememberSweepImageLoader()
+    val sortedItems = remember(items, selectedSort) {
+        sortAlbumMedia(items, selectedSort)
+    }
+    val gridState = rememberLazyGridState()
+    val uriById = remember(sortedItems) {
+        HashMap<Long, Uri>(sortedItems.size).apply {
+            sortedItems.forEach { put(it.id, it.contentUri) }
+        }
+    }
     val title = "${Formatters.monthDisplayName(month)} $year"
 
     BackHandler(enabled = isSelectionMode) {
@@ -65,7 +87,7 @@ fun MonthDetailScreen(
                     SelectionTopBar(
                         selectedCount = selectedUris.size,
                         onClearSelection = onClearSelection,
-                        onSelectAll = { onSelectAll(items.map { it.contentUri }) },
+                        onSelectAll = { onSelectAll(sortedItems.map { it.contentUri }) },
                         onPrimaryAction = onTrashSelected,
                     )
                 } else {
@@ -94,11 +116,20 @@ fun MonthDetailScreen(
                                     style = MaterialTheme.typography.titleLarge,
                                 )
                                 Text(
-                                    text = "${items.size} items",
+                                    text = "${sortedItems.size} items",
                                     style = MaterialTheme.typography.bodySmall,
                                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 )
                             }
+                        },
+                        actions = {
+                            SortMenuButton(
+                                selectedSort = selectedSort,
+                                onSortChange = onSortChange,
+                                buttonTestTag = "month_sort_button",
+                                menuTestTag = "month_sort_menu",
+                                optionTagPrefix = "month_sort_option",
+                            )
                         },
                     )
                 }
@@ -109,7 +140,7 @@ fun MonthDetailScreen(
             }
         },
     ) { innerPadding ->
-        if (items.isEmpty()) {
+        if (sortedItems.isEmpty()) {
             Box(
                 contentAlignment = Alignment.Center,
                 modifier = Modifier
@@ -124,6 +155,7 @@ fun MonthDetailScreen(
             }
         } else {
             LazyVerticalGrid(
+                state = gridState,
                 columns = GridCells.Fixed(gridColumns),
                 contentPadding = PaddingValues(top = 4.dp, bottom = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -131,10 +163,16 @@ fun MonthDetailScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
+                    .dragSelectGrid(
+                        gridState = gridState,
+                        isSelectionMode = isSelectionMode,
+                        resolveUriForKey = { key -> (key as? Long)?.let(uriById::get) },
+                        onSelectUris = onSelectUris,
+                    )
                     .testTag("month_detail_grid"),
             ) {
                 items(
-                    items = items,
+                    items = sortedItems,
                     key = { it.id },
                 ) { item ->
                     val isSelected = item.contentUri in selectedUris
@@ -147,10 +185,14 @@ fun MonthDetailScreen(
                             if (isSelectionMode) {
                                 onToggleSelection(item.contentUri)
                             } else {
-                                onOpenViewer(items, item)
+                                onOpenViewer(sortedItems, item)
                             }
                         },
-                        onLongClick = { onToggleSelection(item.contentUri) },
+                        onLongClick = {
+                            if (!isSelected) {
+                                onSelectUris(listOf(item.contentUri))
+                            }
+                        },
                     )
                 }
             }

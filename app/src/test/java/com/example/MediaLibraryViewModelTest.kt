@@ -81,7 +81,11 @@ class MediaLibraryViewModelTest {
         waitUntil { viewModel.uiState.value.trashedMedia.size == 2 }
 
         viewModel.requestPermanentDelete(listOf(image1Uri, image2Uri))
-        waitUntil { viewModel.uiState.value.trashedMedia.isEmpty() }
+        waitUntil {
+            viewModel.uiState.value.trashedMedia.isEmpty() &&
+                provider.remainingIds() == listOf(103L) &&
+                TrashBinStore(app).getTrashedUris().isEmpty()
+        }
 
         assertTrue("Expected no second confirmation IntentSender", pendingOps.isEmpty())
         assertEquals(listOf(103L), provider.remainingIds())
@@ -95,6 +99,10 @@ class MediaLibraryViewModelTest {
         val viewModel = MediaLibraryViewModel(app)
         val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main.immediate)
         val uiJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { viewModel.uiState.collect {} }
+        val snackbars = mutableListOf<SnackbarNotification>()
+        val snackbarJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.snackbarEvents.collect { snackbars.add(it) }
+        }
         waitUntil { viewModel.uiState.value.allMedia.size == 3 }
 
         viewModel.openViewerSession(viewModel.uiState.value.allMedia)
@@ -108,13 +116,14 @@ class MediaLibraryViewModelTest {
         }
 
         viewModel.requestPermanentDelete(listOf(image1Uri))
-        ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
-        Thread.sleep(60L)
-        ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+        waitUntil {
+            snackbars.any { it.message == "Could not delete selected items" } &&
+                viewModel.uiState.value.trashedMedia.map { it.id } == listOf(101L)
+        }
 
-        // Robolectric's MediaStore.createDeleteRequest returns null, so it fails gracefully
-        // without leaving stale state or crashing.
+        assertTrue("No second OS delete modal should ever be emitted", pendingOps.isEmpty())
         assertEquals(listOf(101L, 102L, 103L), provider.remainingIds())
+        snackbarJob.cancel()
         opJob.cancel()
         uiJob.cancel()
     }
@@ -209,6 +218,81 @@ class MediaLibraryViewModelTest {
         uiJob.cancel()
     }
 
+    @Test
+    fun `requestTrash from grid updates UI optimistically and handles large batches immediately`() {
+        val extraUris = (200L..259L).map { id ->
+            provider.addImage(id = id, name = "BATCH_$id.jpg", dateTaken = 1_690_000_000_000L + id)
+            ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        }
+        val viewModel = MediaLibraryViewModel(app)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main.immediate)
+        val uiJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { viewModel.uiState.collect {} }
+        waitUntil { viewModel.uiState.value.allMedia.size == 63 }
+
+        // Select 60 items using selectUris (deduplicates & never deselects existing)
+        viewModel.toggleSelection(extraUris.first())
+        viewModel.selectUris(extraUris + extraUris.take(10))
+        ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+        assertEquals(60, viewModel.uiState.value.selectedUris.size)
+
+        // Batch trash from grid updates active list, trash bin, and selection immediately
+        viewModel.requestTrash(extraUris, fromViewer = false)
+        ShadowLooper.runUiThreadTasksIncludingDelayedTasks()
+        assertEquals(3, viewModel.uiState.value.allMedia.size)
+        assertEquals(60, viewModel.uiState.value.trashedMedia.size)
+        assertTrue(viewModel.uiState.value.selectedUris.isEmpty())
+
+        waitUntil { TrashBinStore(app).getTrashedUris().size == 60 }
+        uiJob.cancel()
+    }
+
+    @Test
+    fun `requestPermanentDelete handles large batches and partial failures accurately`() {
+        val batchUris = (300L..359L).map { id ->
+            provider.addImage(id = id, name = "DEL_$id.jpg", dateTaken = 1_680_000_000_000L + id)
+            ContentUris.withAppendedId(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, id)
+        }
+        val viewModel = MediaLibraryViewModel(app)
+        val scope = kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.Main.immediate)
+        val uiJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { viewModel.uiState.collect {} }
+        val snackbars = mutableListOf<SnackbarNotification>()
+        val snackbarJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.snackbarEvents.collect { snackbars.add(it) }
+        }
+        val pendingOps = mutableListOf<PendingIntentOperation>()
+        val opJob = scope.launch(start = CoroutineStart.UNDISPATCHED) {
+            viewModel.pendingOperation.collect { pendingOps.add(it) }
+        }
+        waitUntil { viewModel.uiState.value.allMedia.size == 63 }
+
+        // Move 1 single item and permanently delete 1
+        viewModel.requestTrash(listOf(image1Uri), fromViewer = false)
+        waitUntil { TrashBinStore(app).getTrashedUris().size == 1 }
+        snackbars.clear()
+        viewModel.requestPermanentDelete(listOf(image1Uri))
+        waitUntil { snackbars.any { it.message == "Deleted permanently" } }
+        assertTrue(provider.remainingIds().none { it == 101L })
+
+        // Move 60 items to trash and protect 1 item (310L) to test partial failure reconciliation
+        viewModel.requestTrash(batchUris, fromViewer = false)
+        waitUntil { TrashBinStore(app).getTrashedUris().size == 60 }
+        provider.protectedIds.add(310L)
+
+        snackbars.clear()
+        viewModel.requestPermanentDelete(batchUris)
+        waitUntil {
+            snackbars.any { it.message == "Deleted 59 items; 1 could not be deleted" } &&
+                viewModel.uiState.value.trashedMedia.map { it.id } == listOf(310L)
+        }
+        assertEquals(setOf(102L, 103L, 310L), provider.remainingIds().toSet())
+        assertEquals(setOf(batchUris[10]), TrashBinStore(app).getTrashedUris())
+        assertTrue(pendingOps.isEmpty())
+
+        snackbarJob.cancel()
+        opJob.cancel()
+        uiJob.cancel()
+    }
+
     private fun waitUntil(timeoutMs: Long = 3_000L, predicate: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (System.currentTimeMillis() < deadline) {
@@ -230,6 +314,7 @@ class MediaLibraryViewModelTest {
         private val lock = Any()
         private val rows = mutableListOf<Row>()
         @Volatile var blockDirectDelete = false
+        val protectedIds = java.util.Collections.synchronizedSet(HashSet<Long>())
 
         fun addImage(id: Long, name: String, dateTaken: Long) {
             synchronized(lock) {
@@ -297,6 +382,9 @@ class MediaLibraryViewModelTest {
                 throw SecurityException("Permission required")
             }
             val id = runCatching { ContentUris.parseId(uri) }.getOrNull() ?: return 0
+            if (id in protectedIds) {
+                throw SecurityException("Protected item")
+            }
             synchronized(lock) {
                 val removed = rows.removeAll { it.id == id }
                 return if (removed) 1 else 0

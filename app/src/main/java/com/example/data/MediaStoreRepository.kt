@@ -14,9 +14,14 @@ import android.os.Looper
 import android.provider.MediaStore
 import com.example.model.MediaItem
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.callbackFlow
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 
 data class MediaScanResult(
@@ -62,7 +67,10 @@ class MediaStoreRepository(context: Context) {
             trashedOnly = false,
         )
         val allNonOsTrashed = (nonOsTrashedImages + nonOsTrashedVideos)
-            .sortedByDescending { it.effectiveTimestampMillis }
+            .sortedWith(
+                compareByDescending<MediaItem> { it.effectiveTimestampMillis }
+                    .thenByDescending { it.id },
+            )
 
         val osTrashed = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
             val images = queryCollection(
@@ -105,8 +113,13 @@ class MediaStoreRepository(context: Context) {
      * Attempts a silent OS-level IS_TRASHED update when permitted by scoped storage
      * (e.g. app-owned media or MANAGE_MEDIA), and otherwise tracks the verified URI in TrashBinStore.
      */
-    suspend fun moveToTrashImmediate(uris: List<Uri>): List<Uri> = withContext(Dispatchers.IO) {
-        val existing = filterExistingUris(uris).distinct()
+    suspend fun moveToTrashImmediate(
+        uris: List<Uri>,
+        skipExistenceCheck: Boolean = false,
+    ): List<Uri> = withContext(Dispatchers.IO) {
+        val distinctUris = uris.distinct()
+        if (distinctUris.isEmpty()) return@withContext emptyList()
+        val existing = if (skipExistenceCheck) distinctUris else filterExistingUris(distinctUris)
         if (existing.isEmpty()) return@withContext emptyList()
 
         val canSilentOsTrash = Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
@@ -116,14 +129,18 @@ class MediaStoreRepository(context: Context) {
             val values = ContentValues().apply {
                 put(MediaStore.MediaColumns.IS_TRASHED, 1)
             }
-            val remainingForStore = mutableListOf<Uri>()
-            for (uri in existing) {
-                val updated = runCatching {
-                    contentResolver.update(uri, values, null, null) > 0
-                }.getOrDefault(false)
-                if (!updated) {
-                    remainingForStore.add(uri)
-                }
+            val semaphore = Semaphore(PARALLEL_IO_CONCURRENCY)
+            val remainingForStore = coroutineScope {
+                existing.map { uri ->
+                    async {
+                        val updated = semaphore.withPermit {
+                            runCatching {
+                                contentResolver.update(uri, values, null, null) > 0
+                            }.getOrDefault(false)
+                        }
+                        if (updated) null else uri
+                    }
+                }.awaitAll().filterNotNull()
             }
             if (remainingForStore.isNotEmpty()) {
                 trashBinStore.addToTrash(remainingForStore)
@@ -183,19 +200,112 @@ class MediaStoreRepository(context: Context) {
     fun getAppTrashedUris(): Set<Uri> = trashBinStore.getTrashedUris()
 
     suspend fun filterExistingUris(uris: List<Uri>): List<Uri> = withContext(Dispatchers.IO) {
-        uris.filter { uri ->
-            runCatching {
+        val distinct = uris.distinct()
+        if (distinct.isEmpty()) return@withContext emptyList()
+        if (distinct.size == 1) {
+            val uri = distinct.first()
+            return@withContext if (uriExists(uri)) listOf(uri) else emptyList()
+        }
+
+        val existingSet = HashSet<Uri>(distinct.size)
+        val imageUris = ArrayList<Pair<Long, Uri>>()
+        val videoUris = ArrayList<Pair<Long, Uri>>()
+        val otherUris = ArrayList<Uri>()
+
+        for (uri in distinct) {
+            val id = runCatching { ContentUris.parseId(uri) }.getOrNull()
+            when {
+                id != null && uri.toString().startsWith(MediaStore.Images.Media.EXTERNAL_CONTENT_URI.toString()) ->
+                    imageUris.add(id to uri)
+                id != null && uri.toString().startsWith(MediaStore.Video.Media.EXTERNAL_CONTENT_URI.toString()) ->
+                    videoUris.add(id to uri)
+                else -> otherUris.add(uri)
+            }
+        }
+
+        if (imageUris.isNotEmpty()) {
+            queryExistingIdsInCollection(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                imageUris,
+                existingSet,
+            )
+        }
+        if (videoUris.isNotEmpty()) {
+            queryExistingIdsInCollection(
+                MediaStore.Video.Media.EXTERNAL_CONTENT_URI,
+                videoUris,
+                existingSet,
+            )
+        }
+        if (otherUris.isNotEmpty()) {
+            val semaphore = Semaphore(PARALLEL_IO_CONCURRENCY)
+            coroutineScope {
+                otherUris.map { uri ->
+                    async {
+                        if (semaphore.withPermit { uriExists(uri) }) uri else null
+                    }
+                }.awaitAll().filterNotNullTo(existingSet)
+            }
+        }
+
+        distinct.filter { it in existingSet }
+    }
+
+    private fun queryExistingIdsInCollection(
+        collectionUri: Uri,
+        idUriPairs: List<Pair<Long, Uri>>,
+        outExisting: MutableSet<Uri>,
+    ) {
+        val uriById = HashMap<Long, Uri>(idUriPairs.size)
+        for ((id, uri) in idUriPairs) {
+            uriById[id] = uri
+        }
+        for (chunk in idUriPairs.chunked(SQLITE_IN_CHUNK_SIZE)) {
+            val placeholders = chunk.joinToString(",") { "?" }
+            val selection = "${MediaStore.MediaColumns._ID} IN ($placeholders)"
+            val selectionArgs = chunk.map { it.first.toString() }.toTypedArray()
+            val queried = runCatching {
                 contentResolver.query(
-                    uri,
+                    collectionUri,
                     arrayOf(MediaStore.MediaColumns._ID),
-                    null,
-                    null,
+                    selection,
+                    selectionArgs,
                     null,
                 )?.use { cursor ->
-                    cursor.moveToFirst()
+                    val idCol = cursor.getColumnIndex(MediaStore.MediaColumns._ID)
+                    if (idCol >= 0) {
+                        while (cursor.moveToNext()) {
+                            val foundId = cursor.getLong(idCol)
+                            uriById[foundId]?.let { outExisting.add(it) }
+                        }
+                        true
+                    } else {
+                        false
+                    }
                 } ?: false
             }.getOrDefault(false)
+
+            // Fallback per-URI only if the provider rejected IN selection (e.g., strict custom mock)
+            if (!queried) {
+                for ((_, uri) in chunk) {
+                    if (uriExists(uri)) outExisting.add(uri)
+                }
+            }
         }
+    }
+
+    private fun uriExists(uri: Uri): Boolean {
+        return runCatching {
+            contentResolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns._ID),
+                null,
+                null,
+                null,
+            )?.use { cursor ->
+                cursor.moveToFirst()
+            } ?: false
+        }.getOrDefault(false)
     }
 
     fun buildTrashIntentSender(uris: List<Uri>, trash: Boolean): IntentSender? {
@@ -256,32 +366,42 @@ class MediaStoreRepository(context: Context) {
     }
 
     /**
-     * Attempts direct deletion via ContentResolver for each URI (succeeds without a system prompt
-     * on API < 30, for app-owned media, or when MANAGE_MEDIA is granted). Returns the pair
-     * (deletedDirectly, needsOsConfirmation).
+     * Attempts direct deletion via ContentResolver using bounded parallelism (succeeds without a
+     * system prompt on API < 30, for app-owned media, or when MANAGE_MEDIA is granted). Returns
+     * the pair (deletedDirectly, failedOrProtectedUris).
      */
     suspend fun deleteDirectlyWherePermitted(uris: List<Uri>): Pair<List<Uri>, List<Uri>> =
         withContext(Dispatchers.IO) {
-            val deleted = mutableListOf<Uri>()
-            val needsOsConfirmation = mutableListOf<Uri>()
-            for (uri in uris) {
-                val rows = runCatching { contentResolver.delete(uri, null, null) }.getOrDefault(0)
-                if (rows > 0) {
-                    deleted.add(uri)
-                } else {
-                    needsOsConfirmation.add(uri)
-                }
+            val distinctUris = uris.distinct()
+            if (distinctUris.isEmpty()) return@withContext emptyList<Uri>() to emptyList()
+
+            val semaphore = Semaphore(PARALLEL_IO_CONCURRENCY)
+            val outcomes = coroutineScope {
+                distinctUris.map { uri ->
+                    async {
+                        val rows = semaphore.withPermit {
+                            runCatching { contentResolver.delete(uri, null, null) }.getOrDefault(0)
+                        }
+                        uri to (rows > 0)
+                    }
+                }.awaitAll()
             }
-            deleted to needsOsConfirmation
+            val deleted = ArrayList<Uri>(distinctUris.size)
+            val failed = ArrayList<Uri>()
+            for ((uri, ok) in outcomes) {
+                if (ok) deleted.add(uri) else failed.add(uri)
+            }
+            deleted to failed
         }
 
     suspend fun deleteDirectlyLegacy(uris: List<Uri>): Boolean = withContext(Dispatchers.IO) {
-        var allDeleted = true
-        for (uri in uris) {
-            val rows = runCatching { contentResolver.delete(uri, null, null) }.getOrDefault(0)
-            if (rows <= 0) allDeleted = false
-        }
-        allDeleted
+        val (_, failed) = deleteDirectlyWherePermitted(uris)
+        failed.isEmpty()
+    }
+
+    companion object {
+        private const val PARALLEL_IO_CONCURRENCY = 6
+        private const val SQLITE_IN_CHUNK_SIZE = 450
     }
 
     private fun queryCollection(

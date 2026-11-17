@@ -11,12 +11,9 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
-import androidx.compose.material.icons.automirrored.outlined.Sort
-import androidx.compose.material.icons.outlined.Check
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
@@ -28,26 +25,20 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
-import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.semantics.selected
-import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
-import com.example.R
 import com.example.model.AlbumCollection
 import com.example.model.AlbumSortOption
 import com.example.model.MediaItem
 import com.example.model.sortAlbumMedia
 import com.example.ui.components.MediaThumbnailTile
 import com.example.ui.components.SelectionTopBar
+import com.example.ui.components.SortMenuButton
+import com.example.ui.components.dragSelectGrid
 import com.example.ui.components.rememberSweepImageLoader
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -56,7 +47,7 @@ fun AlbumDetailScreen(
     album: AlbumCollection?,
     selectedUris: Set<Uri>,
     gridColumns: Int,
-    selectedSort: AlbumSortOption = AlbumSortOption.OLDEST_FIRST,
+    selectedSort: AlbumSortOption = AlbumSortOption.NEWEST_FIRST,
     onSortChange: (AlbumSortOption) -> Unit = {},
     onBack: () -> Unit,
     onOpenViewer: (List<MediaItem>, MediaItem) -> Unit,
@@ -64,13 +55,23 @@ fun AlbumDetailScreen(
     onSelectAll: (List<Uri>) -> Unit,
     onClearSelection: () -> Unit,
     onTrashSelected: () -> Unit,
+    onSelectUris: (List<Uri>) -> Unit = { uris ->
+        uris.forEach { uri ->
+            if (uri !in selectedUris) onToggleSelection(uri)
+        }
+    },
 ) {
     val isSelectionMode = selectedUris.isNotEmpty()
     val imageLoader = rememberSweepImageLoader()
     val items = remember(album?.items, selectedSort) {
         sortAlbumMedia(album?.items.orEmpty(), selectedSort)
     }
-    var showSortMenu by remember { mutableStateOf(false) }
+    val gridState = rememberLazyGridState()
+    val uriById = remember(items) {
+        HashMap<Long, Uri>(items.size).apply {
+            items.forEach { put(it.id, it.contentUri) }
+        }
+    }
 
     BackHandler(enabled = isSelectionMode) {
         onClearSelection()
@@ -126,63 +127,13 @@ fun AlbumDetailScreen(
                             }
                         },
                         actions = {
-                            Box {
-                                IconButton(
-                                    onClick = { showSortMenu = true },
-                                    modifier = Modifier
-                                        .minimumInteractiveComponentSize()
-                                        .testTag("album_sort_button"),
-                                ) {
-                                    Icon(
-                                        imageVector = Icons.AutoMirrored.Outlined.Sort,
-                                        contentDescription = stringResource(R.string.sort_by),
-                                    )
-                                }
-                                DropdownMenu(
-                                    expanded = showSortMenu,
-                                    onDismissRequest = { showSortMenu = false },
-                                    modifier = Modifier.testTag("album_sort_menu"),
-                                ) {
-                                    AlbumSortOption.entries.forEach { option ->
-                                        val isSelected = option == selectedSort
-                                        DropdownMenuItem(
-                                            text = {
-                                                Text(
-                                                    text = stringResource(option.labelRes()),
-                                                    fontWeight = if (isSelected) {
-                                                        FontWeight.SemiBold
-                                                    } else {
-                                                        FontWeight.Normal
-                                                    },
-                                                    color = if (isSelected) {
-                                                        MaterialTheme.colorScheme.primary
-                                                    } else {
-                                                        MaterialTheme.colorScheme.onSurface
-                                                    },
-                                                )
-                                            },
-                                            trailingIcon = if (isSelected) {
-                                                {
-                                                    Icon(
-                                                        imageVector = Icons.Outlined.Check,
-                                                        contentDescription = null,
-                                                        tint = MaterialTheme.colorScheme.primary,
-                                                    )
-                                                }
-                                            } else {
-                                                null
-                                            },
-                                            onClick = {
-                                                showSortMenu = false
-                                                onSortChange(option)
-                                            },
-                                            modifier = Modifier
-                                                .semantics { selected = isSelected }
-                                                .testTag("album_sort_option_${option.name.lowercase()}"),
-                                        )
-                                    }
-                                }
-                            }
+                            SortMenuButton(
+                                selectedSort = selectedSort,
+                                onSortChange = onSortChange,
+                                buttonTestTag = "album_sort_button",
+                                menuTestTag = "album_sort_menu",
+                                optionTagPrefix = "album_sort_option",
+                            )
                         },
                     )
                 }
@@ -208,6 +159,7 @@ fun AlbumDetailScreen(
             }
         } else {
             LazyVerticalGrid(
+                state = gridState,
                 columns = GridCells.Fixed(gridColumns),
                 contentPadding = PaddingValues(top = 4.dp, bottom = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -215,6 +167,12 @@ fun AlbumDetailScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
+                    .dragSelectGrid(
+                        gridState = gridState,
+                        isSelectionMode = isSelectionMode,
+                        resolveUriForKey = { key -> (key as? Long)?.let(uriById::get) },
+                        onSelectUris = onSelectUris,
+                    )
                     .testTag("album_detail_grid"),
             ) {
                 items(
@@ -234,17 +192,14 @@ fun AlbumDetailScreen(
                                 onOpenViewer(items, item)
                             }
                         },
-                        onLongClick = { onToggleSelection(item.contentUri) },
+                        onLongClick = {
+                            if (!isSelected) {
+                                onSelectUris(listOf(item.contentUri))
+                            }
+                        },
                     )
                 }
             }
         }
     }
-}
-
-private fun AlbumSortOption.labelRes(): Int = when (this) {
-    AlbumSortOption.OLDEST_FIRST -> R.string.sort_oldest_first
-    AlbumSortOption.NEWEST_FIRST -> R.string.sort_newest_first
-    AlbumSortOption.LARGEST_FIRST -> R.string.sort_largest_first
-    AlbumSortOption.SMALLEST_FIRST -> R.string.sort_smallest_first
 }

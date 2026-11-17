@@ -156,11 +156,13 @@ class ViewerAndTrashUiTest {
         var minDistanceToTrash = Float.MAX_VALUE
         var maxStepJump = 0f
 
-        repeat(28) {
+        var midFlightObserved = false
+        repeat(38) { frame ->
             val exitingNodes = composeTestRule
                 .onAllNodes(androidx.compose.ui.test.hasTestTag("viewer_exiting_media_card_1"))
                 .fetchSemanticsNodes()
             if (exitingNodes.isNotEmpty()) {
+                if (frame >= 10) midFlightObserved = true
                 val bounds = exitingNodes.first().boundsInRoot
                 val topCenter = Offset((bounds.left + bounds.right) * 0.5f, bounds.top)
                 if (bounds.top < viewportInitial.top && bounds.top < topHeaderInitial.bottom) {
@@ -192,6 +194,7 @@ class ViewerAndTrashUiTest {
             composeTestRule.mainClock.advanceTimeBy(16L)
         }
 
+        assertTrue("Exiting card should stay controlled past 160ms", midFlightObserved)
         assertTrue("Exiting card must pass unclipped over viewer_top_header", observedOverHeader)
         assertTrue(
             "Top-center must converge toward Trash Bin icon (start=$firstDistanceToTrash, min=$minDistanceToTrash)",
@@ -262,6 +265,38 @@ class ViewerAndTrashUiTest {
         composeTestRule.waitForIdle()
         assertEquals(2, trashed.size)
         composeTestRule.onNodeWithText("2", useUnmergedTree = true).assertExists()
+
+        // Wait & verify undo button works smoothly on last frame too
+        composeTestRule.waitForIdle()
+    }
+
+    @Test
+    fun `viewer_trash_badge_displays_99_plus_without_clipping`() {
+        composeTestRule.setContent {
+            SweepTheme {
+                MediaViewerScreen(
+                    items = sampleItems(2),
+                    initialMediaId = 1L,
+                    isTrashPreview = false,
+                    trashCount = 125,
+                    undoRedoState = UndoRedoUiState(),
+                    onBack = {},
+                    onOpenTrash = {},
+                    onTrashItem = {},
+                    onRestoreItem = {},
+                    onPermanentDeleteItem = {},
+                    onUndo = {},
+                    onRedo = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithText("99+", useUnmergedTree = true).assertIsDisplayed()
+        val headerBounds = composeTestRule.onNodeWithTag("viewer_top_header").fetchSemanticsNode().boundsInRoot
+        val badgeBounds = composeTestRule.onNodeWithTag("viewer_trash_badge", useUnmergedTree = true).fetchSemanticsNode().boundsInRoot
+        assertTrue("99+ pill badge should be wider than tall ($badgeBounds)", badgeBounds.width > badgeBounds.height)
+        assertTrue("99+ badge must stay inside right header boundary", badgeBounds.right <= headerBounds.right + 0.5f)
     }
 
     @Test

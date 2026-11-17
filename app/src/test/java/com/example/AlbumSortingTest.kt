@@ -28,8 +28,14 @@ import com.example.model.AlbumCollection
 import com.example.model.AlbumKind
 import com.example.model.AlbumSortOption
 import com.example.model.MediaItem
+import com.example.model.PermissionAccessState
+import com.example.model.TimelineMonthGroup
+import com.example.model.TimelineYearGroup
 import com.example.model.sortAlbumMedia
 import com.example.ui.screens.AlbumDetailScreen
+import com.example.ui.screens.MonthDetailScreen
+import com.example.ui.screens.TimelineScreen
+import com.example.ui.state.MediaLibraryUiState
 import com.example.ui.state.MediaLibraryViewModel
 import com.example.ui.theme.SweepTheme
 import kotlinx.coroutines.CoroutineScope
@@ -189,36 +195,41 @@ class AlbumSortingTest {
     }
 
     @Test
-    fun `viewmodel_defaults_all_albums_to_oldest_first_keeps_per_album_sort_and_survives_refresh`() {
+    fun `viewmodel_defaults_all_albums_and_months_to_newest_first_keeps_per_collection_sort_and_survives_refresh`() {
         val viewModel = MediaLibraryViewModel(app)
         val scope = CoroutineScope(Dispatchers.Main.immediate)
         val uiJob = scope.launch(start = CoroutineStart.UNDISPATCHED) { viewModel.uiState.collect {} }
         waitUntil { viewModel.uiState.value.albums.size >= 3 }
 
-        // Even though MediaStore scan returns newest first, all albums default to Oldest first
-        // using original creation date (DATE_TAKEN), not DATE_MODIFIED.
+        // All albums default to Newest first using original creation date (DATE_TAKEN),
+        // falling back to DATE_MODIFIED only when DATE_TAKEN is missing.
         val cameraDefault = viewModel.getAlbumById("bucket_10")!!
         val downloadsDefault = viewModel.getAlbumById("bucket_20")!!
         val logicalPhotosDefault = viewModel.getAlbumById("logical_photos")!!
 
-        assertEquals(listOf(1L, 4L, 2L, 3L), cameraDefault.items.map { it.id })
-        assertEquals(listOf(22L, 21L), downloadsDefault.items.map { it.id })
-        assertEquals(listOf(22L, 1L, 4L, 2L, 21L, 3L), logicalPhotosDefault.items.map { it.id })
+        assertEquals(listOf(3L, 2L, 4L, 1L), cameraDefault.items.map { it.id })
+        assertEquals(listOf(21L, 22L), downloadsDefault.items.map { it.id })
+        assertEquals(listOf(3L, 21L, 2L, 4L, 1L, 22L), logicalPhotosDefault.items.map { it.id })
 
-        // Switch Camera to Largest first; Downloads must stay Oldest first independently
+        // Switch Camera to Largest first; Downloads must stay Newest first independently
         viewModel.setAlbumSortOption("bucket_10", AlbumSortOption.LARGEST_FIRST)
         waitUntil {
             viewModel.getAlbumById("bucket_10")?.items?.map { it.id } == listOf(2L, 4L, 1L, 3L)
         }
         assertEquals(AlbumSortOption.LARGEST_FIRST, viewModel.uiState.value.albumSortOptions["bucket_10"])
-        assertEquals(listOf(22L, 21L), viewModel.getAlbumById("bucket_20")!!.items.map { it.id })
+        assertEquals(listOf(21L, 22L), viewModel.getAlbumById("bucket_20")!!.items.map { it.id })
 
-        // Switch Downloads to Newest first while Camera remains Largest first
-        viewModel.setAlbumSortOption("bucket_20", AlbumSortOption.NEWEST_FIRST)
+        // Switch Downloads to Oldest first while Camera remains Largest first
+        viewModel.setAlbumSortOption("bucket_20", AlbumSortOption.OLDEST_FIRST)
         waitUntil {
-            viewModel.getAlbumById("bucket_20")?.items?.map { it.id } == listOf(21L, 22L)
+            viewModel.getAlbumById("bucket_20")?.items?.map { it.id } == listOf(22L, 21L)
         }
         assertEquals(listOf(2L, 4L, 1L, 3L), viewModel.getAlbumById("bucket_10")!!.items.map { it.id })
+
+        // Month sorting defaults to Newest first and can be configured per-month independently
+        val (y, m) = com.example.util.Formatters.yearMonthPair(1_700_000_000_000L)
+        viewModel.setMonthSortOption(y, m, AlbumSortOption.SMALLEST_FIRST)
+        waitUntil { viewModel.uiState.value.monthSortOptions["${y}_$m"] == AlbumSortOption.SMALLEST_FIRST }
 
         // Refresh media (with a newly added photo in Camera) -> preserves selected sort!
         provider.addMedia(
@@ -235,9 +246,10 @@ class AlbumSortingTest {
 
         assertEquals(AlbumSortOption.LARGEST_FIRST, viewModel.uiState.value.albumSortOptions["bucket_10"])
         assertEquals(listOf(5L, 2L, 4L, 1L, 3L), viewModel.getAlbumById("bucket_10")!!.items.map { it.id })
-        assertEquals(listOf(21L, 22L), viewModel.getAlbumById("bucket_20")!!.items.map { it.id })
-        // Uncustomized logical album still defaults to Oldest first
-        assertEquals(listOf(22L, 1L, 4L, 2L, 21L, 3L, 5L), viewModel.getAlbumById("logical_photos")!!.items.map { it.id })
+        assertEquals(listOf(22L, 21L), viewModel.getAlbumById("bucket_20")!!.items.map { it.id })
+        // Uncustomized logical album still defaults to Newest first
+        assertEquals(listOf(5L, 3L, 21L, 2L, 4L, 1L, 22L), viewModel.getAlbumById("logical_photos")!!.items.map { it.id })
+        assertEquals(AlbumSortOption.SMALLEST_FIRST, viewModel.uiState.value.monthSortOptions["${y}_$m"])
 
         uiJob.cancel()
     }
@@ -279,7 +291,7 @@ class AlbumSortingTest {
                 var activeAlbumId by remember { mutableStateOf("bucket_10") }
                 val sortMap = remember { mutableStateMapOf<String, AlbumSortOption>() }
                 val activeAlbum = if (activeAlbumId == "bucket_10") album1 else album2
-                val activeSort = sortMap[activeAlbumId] ?: AlbumSortOption.OLDEST_FIRST
+                val activeSort = sortMap[activeAlbumId] ?: AlbumSortOption.NEWEST_FIRST
 
                 AlbumDetailScreen(
                     album = activeAlbum,
@@ -298,32 +310,31 @@ class AlbumSortingTest {
         }
 
         composeTestRule.waitForIdle()
-        // Sort control is on the right side of the header
         val backBounds = composeTestRule.onNodeWithTag("album_detail_back_button").fetchSemanticsNode().boundsInRoot
         val sortBounds = composeTestRule.onNodeWithTag("album_sort_button").fetchSemanticsNode().boundsInRoot
         assertTrue("Sort icon should be on the right side of the header", sortBounds.left > backBounds.right)
 
-        // Default order in Album 1 is Oldest first: 11 -> 12 -> 10
-        assertVerticalOrder(listOf("media_tile_11", "media_tile_12", "media_tile_10"))
+        // Default order in Album 1 is Newest first: 10 -> 12 -> 11
+        assertVerticalOrder(listOf("media_tile_10", "media_tile_12", "media_tile_11"))
 
-        // Open Sort menu and verify Oldest first is selected by default
+        // Open Sort menu and verify Newest first is selected by default
         composeTestRule.onNodeWithTag("album_sort_button").performClick()
         composeTestRule.waitForIdle()
         composeTestRule.onNodeWithTag("album_sort_menu").assertIsDisplayed()
-        composeTestRule.onNodeWithTag("album_sort_option_oldest_first")
-            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Selected, true))
         composeTestRule.onNodeWithTag("album_sort_option_newest_first")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Selected, true))
+        composeTestRule.onNodeWithTag("album_sort_option_oldest_first")
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.Selected, false))
 
-        // Select Newest first -> 10 -> 12 -> 11
-        composeTestRule.onNodeWithTag("album_sort_option_newest_first").performClick()
+        // Select Oldest first -> 11 -> 12 -> 10
+        composeTestRule.onNodeWithTag("album_sort_option_oldest_first").performClick()
         composeTestRule.waitForIdle()
-        assertVerticalOrder(listOf("media_tile_10", "media_tile_12", "media_tile_11"))
+        assertVerticalOrder(listOf("media_tile_11", "media_tile_12", "media_tile_10"))
 
         // Select Largest first -> 12 -> 11 -> 10
         composeTestRule.onNodeWithTag("album_sort_button").performClick()
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("album_sort_option_newest_first")
+        composeTestRule.onNodeWithTag("album_sort_option_oldest_first")
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.Selected, true))
         composeTestRule.onNodeWithTag("album_sort_option_largest_first").performClick()
         composeTestRule.waitForIdle()
@@ -336,20 +347,149 @@ class AlbumSortingTest {
         composeTestRule.waitForIdle()
         assertVerticalOrder(listOf("media_tile_10", "media_tile_11", "media_tile_12"))
 
-        // Switch to Album 2 -> defaults independently to Oldest first (21 -> 20)
+        // Switch to Album 2 -> defaults independently to Newest first (20 -> 21)
         composeTestRule.onNodeWithTag("album_detail_back_button").performClick()
         composeTestRule.waitForIdle()
-        assertVerticalOrder(listOf("media_tile_21", "media_tile_20"))
+        assertVerticalOrder(listOf("media_tile_20", "media_tile_21"))
         composeTestRule.onNodeWithTag("album_sort_button").performClick()
         composeTestRule.waitForIdle()
-        composeTestRule.onNodeWithTag("album_sort_option_oldest_first")
+        composeTestRule.onNodeWithTag("album_sort_option_newest_first")
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.Selected, true))
-        // Dismiss / switch back to Album 1 -> Album 1 preserves Smallest first (10 -> 11 -> 12)
-        composeTestRule.onNodeWithTag("album_sort_option_oldest_first").performClick()
+        composeTestRule.onNodeWithTag("album_sort_option_newest_first").performClick()
         composeTestRule.waitForIdle()
+
+        // Switch back to Album 1 -> Album 1 preserves Smallest first (10 -> 11 -> 12)
         composeTestRule.onNodeWithTag("album_detail_back_button").performClick()
         composeTestRule.waitForIdle()
         assertVerticalOrder(listOf("media_tile_10", "media_tile_11", "media_tile_12"))
+    }
+
+    @Test
+    fun `month_detail_header_sort_defaults_newest_first_supports_all_modes_and_persists_per_month`() {
+        val decItems = listOf(
+            sampleItem(id = 101L, dateTaken = 3_000L, dateModified = 3_000L, size = 1_000L), // newest & smallest
+            sampleItem(id = 102L, dateTaken = 1_000L, dateModified = 9_000L, size = 5_000L), // oldest
+            sampleItem(id = 103L, dateTaken = 2_000L, dateModified = 2_000L, size = 9_000L), // middle & largest
+        )
+        val novItems = listOf(
+            sampleItem(id = 201L, dateTaken = 4_000L, dateModified = 4_000L, size = 2_000L),
+            sampleItem(id = 202L, dateTaken = 1_500L, dateModified = 1_500L, size = 6_000L),
+        )
+
+        composeTestRule.setContent {
+            SweepTheme {
+                var activeMonth by remember { mutableStateOf(12) }
+                val sortMap = remember { mutableStateMapOf<String, AlbumSortOption>() }
+                val key = "2024_$activeMonth"
+                val items = if (activeMonth == 12) decItems else novItems
+                val selectedSort = sortMap[key] ?: AlbumSortOption.NEWEST_FIRST
+
+                MonthDetailScreen(
+                    year = 2024,
+                    month = activeMonth,
+                    items = items,
+                    selectedUris = emptySet(),
+                    gridColumns = 1,
+                    selectedSort = selectedSort,
+                    onSortChange = { sortMap[key] = it },
+                    onBack = { activeMonth = if (activeMonth == 12) 11 else 12 },
+                    onOpenViewer = { _, _ -> },
+                    onToggleSelection = {},
+                    onSelectAll = {},
+                    onClearSelection = {},
+                    onTrashSelected = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        val backBounds = composeTestRule.onNodeWithTag("month_detail_back_button").fetchSemanticsNode().boundsInRoot
+        val sortBounds = composeTestRule.onNodeWithTag("month_sort_button").fetchSemanticsNode().boundsInRoot
+        assertTrue("Month sort icon should be on the right side of header", sortBounds.left > backBounds.right)
+
+        // Default: Newest first -> 101 -> 103 -> 102
+        assertVerticalOrder(listOf("media_tile_101", "media_tile_103", "media_tile_102"))
+
+        composeTestRule.onNodeWithTag("month_sort_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("month_sort_menu").assertIsDisplayed()
+        composeTestRule.onNodeWithTag("month_sort_option_newest_first")
+            .assert(SemanticsMatcher.expectValue(SemanticsProperties.Selected, true))
+        composeTestRule.onNodeWithTag("month_sort_option_oldest_first").performClick()
+        composeTestRule.waitForIdle()
+        assertVerticalOrder(listOf("media_tile_102", "media_tile_103", "media_tile_101"))
+
+        composeTestRule.onNodeWithTag("month_sort_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("month_sort_option_largest_first").performClick()
+        composeTestRule.waitForIdle()
+        assertVerticalOrder(listOf("media_tile_103", "media_tile_102", "media_tile_101"))
+
+        composeTestRule.onNodeWithTag("month_sort_button").performClick()
+        composeTestRule.waitForIdle()
+        composeTestRule.onNodeWithTag("month_sort_option_smallest_first").performClick()
+        composeTestRule.waitForIdle()
+        assertVerticalOrder(listOf("media_tile_101", "media_tile_102", "media_tile_103"))
+
+        // Switch to November -> defaults independently to Newest first (201 -> 202)
+        composeTestRule.onNodeWithTag("month_detail_back_button").performClick()
+        composeTestRule.waitForIdle()
+        assertVerticalOrder(listOf("media_tile_201", "media_tile_202"))
+
+        // Switch back to December -> preserves Smallest first (101 -> 102 -> 103)
+        composeTestRule.onNodeWithTag("month_detail_back_button").performClick()
+        composeTestRule.waitForIdle()
+        assertVerticalOrder(listOf("media_tile_101", "media_tile_102", "media_tile_103"))
+    }
+
+    @Test
+    fun `timeline_screen_orders_months_newest_first_without_any_sort_selector`() {
+        val novItem = sampleItem(id = 301L, dateTaken = 1_731_000_000_000L, dateModified = 1_731_000_000_000L, size = 1_000L)
+        val marItem = sampleItem(id = 302L, dateTaken = 1_710_000_000_000L, dateModified = 1_710_000_000_000L, size = 1_000L)
+        val uiState = MediaLibraryUiState(
+            permissionState = PermissionAccessState.FULL,
+            selectedYear = 2024,
+            timelineYears = listOf(
+                TimelineYearGroup(
+                    year = 2024,
+                    totalCount = 2,
+                    months = listOf(
+                        TimelineMonthGroup(
+                            year = 2024,
+                            month = 11,
+                            monthName = "November",
+                            items = listOf(novItem),
+                        ),
+                        TimelineMonthGroup(
+                            year = 2024,
+                            month = 3,
+                            monthName = "March",
+                            items = listOf(marItem),
+                        ),
+                    ),
+                ),
+            ),
+        )
+
+        composeTestRule.setContent {
+            SweepTheme {
+                TimelineScreen(
+                    uiState = uiState,
+                    onSelectYear = {},
+                    onOpenMonth = { _, _ -> },
+                    onRequestPermission = {},
+                    onOpenSettings = {},
+                    onOpenTrash = {},
+                )
+            }
+        }
+
+        composeTestRule.waitForIdle()
+        // Newest month first (November above March) and NO sort controls on Timeline screen
+        assertVerticalOrder(listOf("timeline_month_2024_11", "timeline_month_2024_3"))
+        composeTestRule.onNodeWithTag("month_sort_button").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("album_sort_button").assertDoesNotExist()
+        composeTestRule.onNodeWithTag("timeline_sort_button").assertDoesNotExist()
     }
 
     private fun assertVerticalOrder(tags: List<String>) {

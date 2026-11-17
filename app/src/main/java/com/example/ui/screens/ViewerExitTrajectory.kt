@@ -100,10 +100,10 @@ internal fun computeTrashBinTrajectoryTransform(
         startRotationDeg * (1f - u) + 1.6f * sin(u * Math.PI).toFloat()
     ).coerceIn(0f, 3.2f)
 
-    val alpha = if (u <= 0.78f) {
+    val alpha = if (u <= 0.80f) {
         1f
     } else {
-        (1f - ((u - 0.78f) / 0.22f)).coerceIn(0f, 1f)
+        (1f - ((u - 0.80f) / 0.20f)).coerceIn(0f, 1f)
     }
 
     val theta = Math.toRadians(rotationDeg.toDouble())

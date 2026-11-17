@@ -13,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.outlined.ArrowBack
 import androidx.compose.material.icons.outlined.Checklist
@@ -47,6 +48,7 @@ import com.example.ui.components.EmptyTrashDialog
 import com.example.ui.components.MediaThumbnailTile
 import com.example.ui.components.PermanentDeleteDialog
 import com.example.ui.components.SelectionTopBar
+import com.example.ui.components.dragSelectGrid
 import com.example.ui.components.rememberSweepImageLoader
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -62,10 +64,21 @@ fun TrashBinScreen(
     onClearSelection: () -> Unit,
     onRestoreUris: (List<Uri>) -> Unit,
     onPermanentDeleteUris: (List<Uri>) -> Unit,
+    onSelectUris: (List<Uri>) -> Unit = { uris ->
+        uris.forEach { uri ->
+            if (uri !in selectedUris) onToggleSelection(uri)
+        }
+    },
 ) {
     var manualSelectionMode by remember { mutableStateOf(false) }
     val isSelectionMode = selectedUris.isNotEmpty() || (manualSelectionMode && trashedItems.isNotEmpty())
     val imageLoader = rememberSweepImageLoader()
+    val gridState = rememberLazyGridState()
+    val uriById = remember(trashedItems) {
+        HashMap<Long, Uri>(trashedItems.size).apply {
+            trashedItems.forEach { put(it.id, it.contentUri) }
+        }
+    }
     var pendingDeleteUris by remember { mutableStateOf<List<Uri>>(emptyList()) }
     var showEmptyTrashDialog by remember { mutableStateOf(false) }
 
@@ -246,6 +259,7 @@ fun TrashBinScreen(
             }
         } else {
             LazyVerticalGrid(
+                state = gridState,
                 columns = GridCells.Fixed(gridColumns),
                 contentPadding = PaddingValues(top = 4.dp, bottom = 16.dp),
                 horizontalArrangement = Arrangement.spacedBy(2.dp),
@@ -253,6 +267,12 @@ fun TrashBinScreen(
                 modifier = Modifier
                     .fillMaxSize()
                     .padding(innerPadding)
+                    .dragSelectGrid(
+                        gridState = gridState,
+                        isSelectionMode = isSelectionMode,
+                        resolveUriForKey = { key -> (key as? Long)?.let(uriById::get) },
+                        onSelectUris = onSelectUris,
+                    )
                     .testTag("trash_grid"),
             ) {
                 items(
@@ -272,7 +292,11 @@ fun TrashBinScreen(
                                 onOpenTrashPreview(trashedItems, item)
                             }
                         },
-                        onLongClick = { onToggleSelection(item.contentUri) },
+                        onLongClick = {
+                            if (!isSelected) {
+                                onSelectUris(listOf(item.contentUri))
+                            }
+                        },
                     )
                 }
             }

@@ -17,21 +17,14 @@ import androidx.compose.foundation.lazy.grid.GridCells
 import androidx.compose.foundation.lazy.grid.GridItemSpan
 import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
 import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.automirrored.outlined.Redo
-import androidx.compose.material.icons.automirrored.outlined.Undo
 import androidx.compose.material.icons.outlined.Close
-import androidx.compose.material.icons.outlined.DeleteOutline
-import androidx.compose.material.icons.outlined.MoreVert
 import androidx.compose.material.icons.outlined.PhotoLibrary
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material3.Badge
-import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.DropdownMenu
-import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.FilterChipDefaults
@@ -45,29 +38,25 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.model.MediaFilter
 import com.example.model.MediaItem
 import com.example.model.PermissionAccessState
+import com.example.ui.components.HeaderTrashButton
 import com.example.ui.components.MediaThumbnailTile
 import com.example.ui.components.PartialAccessBanner
 import com.example.ui.components.PermissionGateView
 import com.example.ui.components.SelectionTopBar
+import com.example.ui.components.dragSelectGrid
 import com.example.ui.components.rememberSweepImageLoader
 import com.example.ui.state.MediaLibraryUiState
-import com.example.ui.theme.SweepBadgeRed
-import com.example.ui.theme.SweepBadgeWhite
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -83,15 +72,23 @@ fun PhotosScreen(
     onSelectAll: (List<Uri>) -> Unit,
     onClearSelection: () -> Unit,
     onTrashSelected: () -> Unit,
-    onUndo: () -> Unit,
-    onRedo: () -> Unit,
     onRequestPermission: () -> Unit,
     onOpenSettings: () -> Unit,
     modifier: Modifier = Modifier,
+    onSelectUris: (List<Uri>) -> Unit = { uris ->
+        uris.forEach { uri ->
+            if (uri !in uiState.selectedUris) onToggleSelection(uri)
+        }
+    },
 ) {
     val isSelectionMode = uiState.selectedUris.isNotEmpty()
     val imageLoader = rememberSweepImageLoader()
-    var showMoreMenu by remember { mutableStateOf(false) }
+    val gridState = rememberLazyGridState()
+    val uriById = remember(uiState.filteredMedia) {
+        HashMap<Long, Uri>(uiState.filteredMedia.size).apply {
+            uiState.filteredMedia.forEach { put(it.id, it.contentUri) }
+        }
+    }
 
     BackHandler(enabled = isSelectionMode || uiState.isSearchActive) {
         when {
@@ -178,84 +175,12 @@ fun PhotosScreen(
                                         contentDescription = "Search media",
                                     )
                                 }
-                                IconButton(
+                                HeaderTrashButton(
+                                    trashCount = uiState.trashedMedia.size,
                                     onClick = onOpenTrash,
-                                    modifier = Modifier
-                                        .minimumInteractiveComponentSize()
-                                        .testTag("open_trash_button"),
-                                ) {
-                                    if (uiState.trashedMedia.isNotEmpty()) {
-                                        BadgedBox(
-                                            badge = {
-                                                Badge(
-                                                    containerColor = SweepBadgeRed,
-                                                    contentColor = SweepBadgeWhite,
-                                                    modifier = Modifier.testTag("photos_trash_badge"),
-                                                ) {
-                                                    val count = uiState.trashedMedia.size
-                                                    Text(
-                                                        text = if (count > 99) "99+" else count.toString(),
-                                                        style = MaterialTheme.typography.labelSmall.copy(
-                                                            fontWeight = FontWeight.SemiBold,
-                                                        ),
-                                                    )
-                                                }
-                                            },
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Outlined.DeleteOutline,
-                                                contentDescription = stringResource(R.string.trash_bin),
-                                            )
-                                        }
-                                    } else {
-                                        Icon(
-                                            imageVector = Icons.Outlined.DeleteOutline,
-                                            contentDescription = stringResource(R.string.trash_bin),
-                                        )
-                                    }
-                                }
-                                if (uiState.undoRedoState.canUndo || uiState.undoRedoState.canRedo) {
-                                    Box {
-                                        IconButton(
-                                            onClick = { showMoreMenu = true },
-                                            modifier = Modifier
-                                                .minimumInteractiveComponentSize()
-                                                .testTag("photos_more_button"),
-                                        ) {
-                                            Icon(
-                                                imageVector = Icons.Outlined.MoreVert,
-                                                contentDescription = "More actions",
-                                            )
-                                        }
-                                        DropdownMenu(
-                                            expanded = showMoreMenu,
-                                            onDismissRequest = { showMoreMenu = false },
-                                        ) {
-                                            DropdownMenuItem(
-                                                text = { Text(stringResource(R.string.undo)) },
-                                                leadingIcon = {
-                                                    Icon(Icons.AutoMirrored.Outlined.Undo, contentDescription = null)
-                                                },
-                                                enabled = uiState.undoRedoState.canUndo,
-                                                onClick = {
-                                                    showMoreMenu = false
-                                                    onUndo()
-                                                },
-                                            )
-                                            DropdownMenuItem(
-                                                text = { Text(stringResource(R.string.redo)) },
-                                                leadingIcon = {
-                                                    Icon(Icons.AutoMirrored.Outlined.Redo, contentDescription = null)
-                                                },
-                                                enabled = uiState.undoRedoState.canRedo,
-                                                onClick = {
-                                                    showMoreMenu = false
-                                                    onRedo()
-                                                },
-                                            )
-                                        }
-                                    }
-                                }
+                                    buttonTestTag = "open_trash_button",
+                                    badgeTestTag = "photos_trash_badge",
+                                )
                             }
                         },
                     )
@@ -354,12 +279,19 @@ fun PhotosScreen(
 
                 else -> {
                     LazyVerticalGrid(
+                        state = gridState,
                         columns = GridCells.Fixed(gridColumns),
                         contentPadding = PaddingValues(bottom = 16.dp),
                         horizontalArrangement = Arrangement.spacedBy(2.dp),
                         verticalArrangement = Arrangement.spacedBy(2.dp),
                         modifier = Modifier
                             .fillMaxSize()
+                            .dragSelectGrid(
+                                gridState = gridState,
+                                isSelectionMode = isSelectionMode,
+                                resolveUriForKey = { key -> (key as? Long)?.let(uriById::get) },
+                                onSelectUris = onSelectUris,
+                            )
                             .testTag("photos_grid"),
                     ) {
                         if (uiState.permissionState == PermissionAccessState.PARTIAL) {
@@ -414,7 +346,9 @@ fun PhotosScreen(
                                         }
                                     },
                                     onLongClick = {
-                                        onToggleSelection(item.contentUri)
+                                        if (!isSelected) {
+                                            onSelectUris(listOf(item.contentUri))
+                                        }
                                     },
                                 )
                             }
