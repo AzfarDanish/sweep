@@ -19,3 +19,8 @@ val SweepWhiteInk = Color(0xFFFAFAFA)
 val SweepMutedDark = Color(0xFF9E9E9E)
 val SweepDividerDark = Color(0xFF262626)
 val SweepDestructiveDark = Color(0xFFF2B8B5)
+
+// Trash Count Badge Colors
+val SweepBadgeRed = Color(0xFFE53935)
+val SweepBadgeWhite = Color(0xFFFFFFFF)
+

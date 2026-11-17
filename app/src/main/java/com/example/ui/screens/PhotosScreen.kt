@@ -54,6 +54,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.model.MediaFilter
@@ -65,6 +66,8 @@ import com.example.ui.components.PermissionGateView
 import com.example.ui.components.SelectionTopBar
 import com.example.ui.components.rememberSweepImageLoader
 import com.example.ui.state.MediaLibraryUiState
+import com.example.ui.theme.SweepBadgeRed
+import com.example.ui.theme.SweepBadgeWhite
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -185,10 +188,17 @@ fun PhotosScreen(
                                         BadgedBox(
                                             badge = {
                                                 Badge(
-                                                    containerColor = MaterialTheme.colorScheme.primary,
-                                                    contentColor = MaterialTheme.colorScheme.onPrimary,
+                                                    containerColor = SweepBadgeRed,
+                                                    contentColor = SweepBadgeWhite,
+                                                    modifier = Modifier.testTag("photos_trash_badge"),
                                                 ) {
-                                                    Text(text = uiState.trashedMedia.size.toString())
+                                                    val count = uiState.trashedMedia.size
+                                                    Text(
+                                                        text = if (count > 99) "99+" else count.toString(),
+                                                        style = MaterialTheme.typography.labelSmall.copy(
+                                                            fontWeight = FontWeight.SemiBold,
+                                                        ),
+                                                    )
                                                 }
                                             },
                                         ) {

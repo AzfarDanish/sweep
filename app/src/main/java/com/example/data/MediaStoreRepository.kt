@@ -255,6 +255,26 @@ class MediaStoreRepository(context: Context) {
         }
     }
 
+    /**
+     * Attempts direct deletion via ContentResolver for each URI (succeeds without a system prompt
+     * on API < 30, for app-owned media, or when MANAGE_MEDIA is granted). Returns the pair
+     * (deletedDirectly, needsOsConfirmation).
+     */
+    suspend fun deleteDirectlyWherePermitted(uris: List<Uri>): Pair<List<Uri>, List<Uri>> =
+        withContext(Dispatchers.IO) {
+            val deleted = mutableListOf<Uri>()
+            val needsOsConfirmation = mutableListOf<Uri>()
+            for (uri in uris) {
+                val rows = runCatching { contentResolver.delete(uri, null, null) }.getOrDefault(0)
+                if (rows > 0) {
+                    deleted.add(uri)
+                } else {
+                    needsOsConfirmation.add(uri)
+                }
+            }
+            deleted to needsOsConfirmation
+        }
+
     suspend fun deleteDirectlyLegacy(uris: List<Uri>): Boolean = withContext(Dispatchers.IO) {
         var allDeleted = true
         for (uri in uris) {

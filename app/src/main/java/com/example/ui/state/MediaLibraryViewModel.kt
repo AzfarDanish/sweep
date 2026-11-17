@@ -532,158 +532,178 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
                 if (fromViewer) {
                     _viewerItems.update { list -> list.filterNot { it.contentUri in uris } }
                 }
+                _trashedMedia.update { list -> list.filterNot { it.contentUri in uris } }
                 _selectedUris.value = emptySet()
                 loadMediaInternal(showSpinner = false)
                 _snackbarEvents.tryEmit(SnackbarNotification("File no longer exists on device"))
                 return@launch
             }
-            val sender = repository.buildDeleteIntentSender(valid)
+
+            // Try direct ContentResolver deletion first so API < 30, app-owned media, and
+            // MANAGE_MEDIA-authorized environments delete immediately after the single Empty Trash
+            // confirmation without showing a redundant confirmation dialog.
+            val (deletedDirectly, needsOsConfirmation) = repository.deleteDirectlyWherePermitted(valid)
+            if (deletedDirectly.isNotEmpty()) {
+                val deletedSet = deletedDirectly.toSet()
+                repository.removeFromAppTrashStore(deletedDirectly)
+                deletedDirectly.forEach { viewerRemovedHistory.remove(it) }
+                if (fromViewer) {
+                    _viewerItems.update { list -> list.filterNot { it.contentUri in deletedSet } }
+                }
+                _trashedMedia.update { list -> list.filterNot { it.contentUri in deletedSet } }
+                _selectedUris.value = emptySet()
+            }
+
+            if (needsOsConfirmation.isEmpty()) {
+                loadMediaInternal(showSpinner = false)
+                _snackbarEvents.tryEmit(
+                    SnackbarNotification(
+                        message = if (deletedDirectly.size == 1) {
+                            "Deleted permanently"
+                        } else {
+                            "Deleted ${deletedDirectly.size} items permanently"
+                        },
+                    ),
+                )
+                return@launch
+            }
+
+            val sender = repository.buildDeleteIntentSender(needsOsConfirmation)
             if (sender != null) {
                 val op = PendingIntentOperation(
                     intentSender = sender,
                     type = PendingOperationType.PERMANENT_DELETE,
-                    uris = valid,
+                    uris = needsOsConfirmation,
                     viewerRemoval = fromViewer,
                 )
                 activePendingOp = op
                 _pendingOperation.emit(op)
-            } else if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) {
-                val deleted = repository.deleteDirectlyLegacy(valid)
-                if (deleted) {
-                    repository.removeFromAppTrashStore(valid)
-                    if (fromViewer) {
-                        _viewerItems.update { list -> list.filterNot { it.contentUri in valid } }
-                    }
-                    _selectedUris.value = emptySet()
-                    loadMediaInternal(showSpinner = false)
-                    _snackbarEvents.tryEmit(SnackbarNotification("Deleted permanently"))
-                } else {
-                    _snackbarEvents.tryEmit(SnackbarNotification("Could not delete selected items"))
-                }
+            } else {
+                loadMediaInternal(showSpinner = false)
+                _snackbarEvents.tryEmit(SnackbarNotification("Could not delete selected items"))
             }
         }
     }
 
     fun triggerUndo() {
-        val action = undoRedoManager.peekUndo() ?: return
         viewModelScope.launch {
-            val valid = repository.filterExistingUris(action.uris)
-            if (valid.isEmpty()) {
-                undoRedoManager.discardTopUndo()
-                _snackbarEvents.tryEmit(SnackbarNotification("File is no longer available to undo"))
-                return@launch
-            }
+            var shouldReconcile = false
+            trashMutex.withLock {
+                val action = undoRedoManager.peekUndo() ?: return@launch
+                val valid = repository.filterExistingUris(action.uris)
+                if (valid.isEmpty()) {
+                    undoRedoManager.discardTopUndo()
+                    return@launch
+                }
 
-            when (action) {
-                is TrashAction.MoveToTrash -> {
-                    val trashedLookup = _trashedMedia.value.associateBy { it.contentUri }
-                    val itemsToRestore = valid.map { uri ->
-                        trashedLookup[uri] ?: viewerRemovedHistory[uri]?.second?.copy(isTrashed = true)
-                    }.filterNotNull()
+                when (action) {
+                    is TrashAction.MoveToTrash -> {
+                        val trashedLookup = _trashedMedia.value.associateBy { it.contentUri }
+                        val itemsToRestore = valid.mapNotNull { uri ->
+                            trashedLookup[uri] ?: viewerRemovedHistory[uri]?.second?.copy(isTrashed = true)
+                        }
 
-                    val (restoredSilently, needsOsAuth) =
-                        repository.restoreImmediateOrNeedsOsAuth(itemsToRestore)
+                        val (restoredSilently, needsOsAuth) =
+                            repository.restoreImmediateOrNeedsOsAuth(itemsToRestore)
 
-                    if (restoredSilently.isNotEmpty()) {
-                        undoRedoManager.commitUndoExecuted()
-                        restoreItemsIntoViewerIfPresent(restoredSilently)
-                        _selectedUris.value = emptySet()
-                        loadMediaInternal(showSpinner = false)
-                        _snackbarEvents.tryEmit(
-                            SnackbarNotification(
-                                message = "Restored to gallery",
-                                actionLabel = "Redo",
-                                isRedoAction = true,
-                            ),
-                        )
+                        if (restoredSilently.isNotEmpty()) {
+                            val restoredSet = restoredSilently.toSet()
+                            undoRedoManager.commitUndoExecuted()
+                            restoreItemsIntoViewerIfPresent(restoredSilently)
+                            _trashedMedia.update { list -> list.filterNot { it.contentUri in restoredSet } }
+                            _selectedUris.value = emptySet()
+                            shouldReconcile = true
+                        }
+
+                        if (needsOsAuth.isNotEmpty()) {
+                            val sender = repository.buildTrashIntentSender(needsOsAuth, trash = false)
+                            if (sender != null) {
+                                val op = PendingIntentOperation(
+                                    intentSender = sender,
+                                    type = PendingOperationType.UNDO,
+                                    uris = needsOsAuth,
+                                )
+                                activePendingOp = op
+                                _pendingOperation.emit(op)
+                            }
+                        }
                     }
 
-                    if (needsOsAuth.isNotEmpty()) {
-                        val sender = repository.buildTrashIntentSender(needsOsAuth, trash = false)
-                        if (sender != null) {
-                            val op = PendingIntentOperation(
-                                intentSender = sender,
-                                type = PendingOperationType.UNDO,
-                                uris = needsOsAuth,
-                            )
-                            activePendingOp = op
-                            _pendingOperation.emit(op)
+                    is TrashAction.RestoreFromTrash -> {
+                        val moved = repository.moveToTrashImmediate(valid)
+                        if (moved.isNotEmpty()) {
+                            undoRedoManager.commitUndoExecuted()
+                            _selectedUris.value = emptySet()
+                            shouldReconcile = true
                         }
                     }
                 }
-
-                is TrashAction.RestoreFromTrash -> {
-                    val moved = repository.moveToTrashImmediate(valid)
-                    if (moved.isNotEmpty()) {
-                        undoRedoManager.commitUndoExecuted()
-                        _selectedUris.value = emptySet()
-                        loadMediaInternal(showSpinner = false)
-                        _snackbarEvents.tryEmit(
-                            SnackbarNotification(
-                                message = "Moved back to trash",
-                                actionLabel = "Redo",
-                                isRedoAction = true,
-                            ),
-                        )
-                    }
-                }
+            }
+            if (shouldReconcile) {
+                scheduleLibraryReconcile(delayMillis = 250L)
             }
         }
     }
 
     fun triggerRedo() {
-        val action = undoRedoManager.peekRedo() ?: return
         viewModelScope.launch {
-            val valid = repository.filterExistingUris(action.uris)
-            if (valid.isEmpty()) {
-                undoRedoManager.discardTopRedo()
-                _snackbarEvents.tryEmit(SnackbarNotification("File is no longer available to redo"))
-                return@launch
-            }
-
-            when (action) {
-                is TrashAction.MoveToTrash -> {
-                    val moved = repository.moveToTrashImmediate(valid)
-                    if (moved.isNotEmpty()) {
-                        undoRedoManager.commitRedoExecuted()
-                        _viewerItems.update { list -> list.filterNot { it.contentUri in moved } }
-                        _selectedUris.value = emptySet()
-                        loadMediaInternal(showSpinner = false)
-                    }
+            var shouldReconcile = false
+            trashMutex.withLock {
+                val action = undoRedoManager.peekRedo() ?: return@launch
+                val valid = repository.filterExistingUris(action.uris)
+                if (valid.isEmpty()) {
+                    undoRedoManager.discardTopRedo()
+                    _snackbarEvents.tryEmit(SnackbarNotification("File is no longer available to redo"))
+                    return@launch
                 }
 
-                is TrashAction.RestoreFromTrash -> {
-                    val trashedLookup = _trashedMedia.value.associateBy { it.contentUri }
-                    val itemsToRestore = valid.mapNotNull { trashedLookup[it] }
-                    val (restoredSilently, needsOsAuth) =
-                        repository.restoreImmediateOrNeedsOsAuth(itemsToRestore)
-
-                    if (restoredSilently.isNotEmpty()) {
-                        undoRedoManager.commitRedoExecuted()
-                        _selectedUris.value = emptySet()
-                        loadMediaInternal(showSpinner = false)
-                        _snackbarEvents.tryEmit(
-                            SnackbarNotification(
-                                message = "Restored from trash",
-                                actionLabel = "Undo",
-                                isUndoAction = true,
-                            ),
-                        )
+                when (action) {
+                    is TrashAction.MoveToTrash -> {
+                        val moved = repository.moveToTrashImmediate(valid)
+                        if (moved.isNotEmpty()) {
+                            undoRedoManager.commitRedoExecuted()
+                            _viewerItems.update { list -> list.filterNot { it.contentUri in moved } }
+                            _selectedUris.value = emptySet()
+                            shouldReconcile = true
+                        }
                     }
 
-                    if (needsOsAuth.isNotEmpty()) {
-                        val sender = repository.buildTrashIntentSender(needsOsAuth, trash = false)
-                        if (sender != null) {
-                            val op = PendingIntentOperation(
-                                intentSender = sender,
-                                type = PendingOperationType.REDO,
-                                uris = needsOsAuth,
+                    is TrashAction.RestoreFromTrash -> {
+                        val trashedLookup = _trashedMedia.value.associateBy { it.contentUri }
+                        val itemsToRestore = valid.mapNotNull { trashedLookup[it] }
+                        val (restoredSilently, needsOsAuth) =
+                            repository.restoreImmediateOrNeedsOsAuth(itemsToRestore)
+
+                        if (restoredSilently.isNotEmpty()) {
+                            undoRedoManager.commitRedoExecuted()
+                            _selectedUris.value = emptySet()
+                            shouldReconcile = true
+                            _snackbarEvents.tryEmit(
+                                SnackbarNotification(
+                                    message = "Restored from trash",
+                                    actionLabel = "Undo",
+                                    isUndoAction = true,
+                                ),
                             )
-                            activePendingOp = op
-                            _pendingOperation.emit(op)
+                        }
+
+                        if (needsOsAuth.isNotEmpty()) {
+                            val sender = repository.buildTrashIntentSender(needsOsAuth, trash = false)
+                            if (sender != null) {
+                                val op = PendingIntentOperation(
+                                    intentSender = sender,
+                                    type = PendingOperationType.REDO,
+                                    uris = needsOsAuth,
+                                )
+                                activePendingOp = op
+                                _pendingOperation.emit(op)
+                            }
                         }
                     }
                 }
+            }
+            if (shouldReconcile) {
+                loadMediaInternal(showSpinner = false)
             }
         }
     }
@@ -758,17 +778,12 @@ class MediaLibraryViewModel(application: Application) : AndroidViewModel(applica
             }
 
             PendingOperationType.UNDO -> {
+                val restoredSet = op.uris.toSet()
                 undoRedoManager.commitUndoExecuted()
                 restoreItemsIntoViewerIfPresent(op.uris)
+                _trashedMedia.update { list -> list.filterNot { it.contentUri in restoredSet } }
                 _selectedUris.value = emptySet()
                 loadMediaInternal(showSpinner = false)
-                _snackbarEvents.tryEmit(
-                    SnackbarNotification(
-                        message = "Action undone",
-                        actionLabel = "Redo",
-                        isRedoAction = true,
-                    ),
-                )
             }
 
             PendingOperationType.REDO -> {
